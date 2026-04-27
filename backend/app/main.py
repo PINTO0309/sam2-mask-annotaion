@@ -29,6 +29,11 @@ class PointPrompt(BaseModel):
 class SAM2PredictPayload(BaseModel):
     image_index: int
     points: list[PointPrompt]
+    model_id: str | None = None
+
+
+class SAM2SelectModelPayload(BaseModel):
+    model_id: str
 
 
 def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None = None) -> FastAPI:
@@ -88,12 +93,23 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"annotation not found: {annotation_id}") from exc
 
+    @app.get("/api/sam2/models")
+    def sam2_models():
+        return app.state.sam2.list_models()
+
+    @app.post("/api/sam2/models/select")
+    def sam2_select_model(payload: SAM2SelectModelPayload):
+        try:
+            return app.state.sam2.select_model(payload.model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/sam2/predict")
     def sam2_predict(payload: SAM2PredictPayload):
         try:
             path = app.state.store.image_path(payload.image_index)
             points = [point.model_dump() for point in payload.points]
-            mask = app.state.sam2.predict(path, points)
+            mask = app.state.sam2.predict(path, points, payload.model_id)
             return {"mask_png": mask_to_png_data_url(mask)}
         except (IndexError, FileNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

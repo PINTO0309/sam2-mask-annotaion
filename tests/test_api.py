@@ -8,7 +8,27 @@ from backend.app.rle import mask_to_png_data_url
 
 
 class FakeSAM2:
-    def predict(self, image_path, points):
+    def __init__(self):
+        self.current_model_id = "tiny"
+        self.last_model_id = None
+
+    def list_models(self):
+        return {
+            "current_model_id": self.current_model_id,
+            "models": [
+                {"id": "tiny", "label": "Tiny", "checkpoint_path": "tiny.pt", "available": True},
+                {"id": "small", "label": "Small", "checkpoint_path": "small.pt", "available": False},
+            ],
+        }
+
+    def select_model(self, model_id):
+        if model_id not in {"tiny", "small"}:
+            raise ValueError(f"unknown SAM2 model: {model_id}")
+        self.current_model_id = model_id
+        return self.list_models()
+
+    def predict(self, image_path, points, model_id=None):
+        self.last_model_id = model_id
         mask = np.zeros((5, 6), dtype=bool)
         mask[1:3, 1:3] = True
         return mask
@@ -40,13 +60,31 @@ def test_image_list_detail_update_save_and_download(sample_store):
 
 
 def test_sam2_predict_endpoint_uses_service(sample_store):
-    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    sam2 = FakeSAM2()
+    app = create_app(store=sample_store, sam2_service=sam2)
     client = TestClient(app)
 
     response = client.post(
         "/api/sam2/predict",
-        json={"image_index": 1, "points": [{"x": 1, "y": 1, "label": 1}]},
+        json={"image_index": 1, "points": [{"x": 1, "y": 1, "label": 1}], "model_id": "small"},
     )
 
     assert response.status_code == 200
     assert response.json()["mask_png"].startswith("data:image/png;base64,")
+    assert sam2.last_model_id == "small"
+
+
+def test_sam2_model_list_and_select(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    models = client.get("/api/sam2/models")
+    assert models.status_code == 200
+    assert models.json()["current_model_id"] == "tiny"
+
+    selected = client.post("/api/sam2/models/select", json={"model_id": "small"})
+    assert selected.status_code == 200
+    assert selected.json()["current_model_id"] == "small"
+
+    invalid = client.post("/api/sam2/models/select", json={"model_id": "missing"})
+    assert invalid.status_code == 400

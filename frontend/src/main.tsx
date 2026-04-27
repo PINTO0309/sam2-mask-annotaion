@@ -49,6 +49,12 @@ type ImageDetail = {
 
 type Tool = "sam_positive" | "sam_negative" | "eraser";
 type UndoItem = { annotationId: number; maskPng: string };
+type SAM2Model = {
+  id: string;
+  label: string;
+  checkpoint_path: string;
+  available: boolean;
+};
 
 const API = "";
 const colorPalette = [
@@ -77,6 +83,8 @@ function App() {
   const [isDrawing, setIsDrawing] = useState(false);
   const [dirtyIds, setDirtyIds] = useState<Set<number>>(new Set());
   const [promptPoints, setPromptPoints] = useState<{ x: number; y: number; label: number }[]>([]);
+  const [sam2Models, setSam2Models] = useState<SAM2Model[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState("tiny");
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -94,6 +102,14 @@ function App() {
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
     setImages(data.images);
+  }, []);
+
+  const loadSam2Models = useCallback(async () => {
+    const response = await fetch(`${API}/api/sam2/models`);
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    setSam2Models(data.models);
+    setSelectedModelId(data.current_model_id);
   }, []);
 
   const canvasToMaskPng = useCallback((annotationId: number) => {
@@ -202,7 +218,8 @@ function App() {
 
   useEffect(() => {
     loadImages().catch((error) => setStatus(`Image list error: ${error.message}`));
-  }, [loadImages]);
+    loadSam2Models().catch((error) => setStatus(`SAM2 model list error: ${error.message}`));
+  }, [loadImages, loadSam2Models]);
 
   useEffect(() => {
     if (images.length > 0 && !detail) {
@@ -302,7 +319,7 @@ function App() {
       const response = await fetch(`${API}/api/sam2/predict`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_index: detail.index, points })
+        body: JSON.stringify({ image_index: detail.index, points, model_id: selectedModelId })
       });
       if (!response.ok) {
         const message = await response.text();
@@ -313,7 +330,28 @@ function App() {
       await replaceMask(selectedId, data.mask_png);
       setStatus("SAM2 mask updated");
     },
-    [detail, promptPoints, pushUndo, replaceMask, selectedId]
+    [detail, promptPoints, pushUndo, replaceMask, selectedId, selectedModelId]
+  );
+
+  const selectSam2Model = useCallback(
+    async (modelId: string) => {
+      setStatus(`Switching SAM2 model: ${modelId}`);
+      const response = await fetch(`${API}/api/sam2/models/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_id: modelId })
+      });
+      if (!response.ok) {
+        setStatus(`SAM2 model error: ${await response.text()}`);
+        return;
+      }
+      const data = await response.json();
+      setSam2Models(data.models);
+      setSelectedModelId(data.current_model_id);
+      setPromptPoints([]);
+      setStatus(`SAM2 model: ${data.current_model_id}`);
+    },
+    []
   );
 
   const handlePointerDown = useCallback(
@@ -442,6 +480,18 @@ function App() {
           <button title="Add instance" onClick={addInstance}>
             <Plus size={18} />
           </button>
+        </section>
+        <section className="model-options" aria-label="SAM2 model">
+          {sam2Models.map((model) => (
+            <button
+              key={model.id}
+              className={model.id === selectedModelId ? "active" : ""}
+              title={`${model.label}${model.available ? "" : " (download on first use)"}`}
+              onClick={() => selectSam2Model(model.id)}
+            >
+              {model.label}
+            </button>
+          ))}
         </section>
         <label className="slider">
           <span>Brush</span>

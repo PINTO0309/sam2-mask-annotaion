@@ -80,6 +80,7 @@ button.active {
 
 .nav-row,
 .tools,
+.model-options,
 .actions {
   display: grid;
   gap: 8px;
@@ -91,6 +92,17 @@ button.active {
 
 .tools {
   grid-template-columns: repeat(5, 34px);
+}
+
+.model-options {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.model-options button {
+  font-size: 12px;
+  height: 30px;
+  min-width: 0;
+  padding: 0 6px;
 }
 
 .actions {
