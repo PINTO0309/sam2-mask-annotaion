@@ -91,7 +91,7 @@ button.active {
 }
 
 .tools {
-  grid-template-columns: repeat(5, 34px);
+  grid-template-columns: repeat(4, 34px);
 }
 
 .model-options {
@@ -205,7 +205,7 @@ button.active {
 
 .image-canvas {
   background: #111;
-  cursor: crosshair;
+  cursor: none;
   display: block;
   image-rendering: pixelated;
 }
@@ -219,6 +219,39 @@ button.active {
   font-size: 13px;
   gap: 18px;
   padding: 0 14px;
+}
+
+.blocking-overlay {
+  align-items: center;
+  background: rgba(12, 18, 21, 0.56);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  position: fixed;
+  z-index: 1000;
+}
+
+.blocking-panel {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #cfd7d3;
+  border-radius: 8px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+  color: #182026;
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  min-width: 280px;
+  padding: 22px 28px;
+}
+
+.blocking-panel strong {
+  font-size: 15px;
+}
+
+.blocking-panel span {
+  color: #58656d;
+  font-size: 13px;
 }
 
 @media (max-width: 960px) {

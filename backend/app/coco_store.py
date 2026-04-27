@@ -30,6 +30,9 @@ class COCOStore:
         self.coco_path = coco_path
         self.images_dir = images_dir
         self.output_path = output_path
+        self.reload()
+
+    def reload(self) -> None:
         with self.coco_path.open("r", encoding="utf-8") as fh:
             self.data: dict[str, Any] = json.load(fh)
 

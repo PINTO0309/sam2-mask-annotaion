@@ -27,6 +27,16 @@ class FakeSAM2:
         self.current_model_id = model_id
         return self.list_models()
 
+    def prepare_model(self, model_id=None):
+        if model_id:
+            self.select_model(model_id)
+        return {
+            "current_model_id": self.current_model_id,
+            "checkpoint_path": f"{self.current_model_id}.pt",
+            "available": True,
+            "models": self.list_models()["models"],
+        }
+
     def predict(self, image_path, points, model_id=None):
         self.last_model_id = model_id
         mask = np.zeros((5, 6), dtype=bool)
@@ -88,3 +98,35 @@ def test_sam2_model_list_and_select(sample_store):
 
     invalid = client.post("/api/sam2/models/select", json={"model_id": "missing"})
     assert invalid.status_code == 400
+
+
+def test_sam2_model_prepare(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    prepared = client.post("/api/sam2/models/prepare", json={"model_id": "small"})
+    assert prepared.status_code == 200
+    assert prepared.json()["current_model_id"] == "small"
+    assert prepared.json()["available"] is True
+
+    invalid = client.post("/api/sam2/models/prepare", json={"model_id": "missing"})
+    assert invalid.status_code == 400
+
+
+def test_reset_edits_reloads_source_coco_and_removes_new_instances(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    changed = np.zeros((5, 6), dtype=bool)
+    changed[0, 0] = True
+    assert client.put("/api/annotations/10/mask", json={"mask_png": mask_to_png_data_url(changed)}).status_code == 200
+    assert client.post("/api/images/2/instances", json={}).status_code == 200
+
+    reset = client.post("/api/reset-edits")
+    assert reset.status_code == 200
+
+    first_detail = client.get("/api/images/1").json()
+    extra_detail = client.get("/api/images/2").json()
+    assert first_detail["annotations"][0]["area"] == 9.0
+    assert extra_detail["annotations"] == []
+    assert extra_detail["in_coco"] is False

@@ -104,6 +104,13 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/sam2/models/prepare")
+    def sam2_prepare_model(payload: SAM2SelectModelPayload):
+        try:
+            return app.state.sam2.prepare_model(payload.model_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/sam2/predict")
     def sam2_predict(payload: SAM2PredictPayload):
         try:
@@ -120,6 +127,11 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
     def save():
         path = app.state.store.save()
         return {"path": str(path), "download_url": "/api/download"}
+
+    @app.post("/api/reset-edits")
+    def reset_edits():
+        app.state.store.reload()
+        return {"ok": True, "image_count": len(app.state.store.entries)}
 
     @app.get("/api/download")
     def download():

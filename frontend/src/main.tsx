@@ -1,16 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { flushSync } from "react-dom";
 import {
   ArrowBigLeft,
   ArrowBigRight,
   ChevronLeft,
   ChevronRight,
-  CircleMinus,
-  CirclePlus,
   Download,
-  Eraser,
   Plus,
   RotateCcw,
+  Trash2,
   Save,
   Sparkles
 } from "lucide-react";
@@ -47,8 +46,9 @@ type ImageDetail = {
   annotations: Annotation[];
 };
 
-type Tool = "sam_positive" | "sam_negative" | "eraser";
-type UndoItem = { annotationId: number; maskPng: string };
+type DrawingAction = "paint" | "erase";
+type UndoStacks = Record<number, string[]>;
+type CanvasPoint = { x: number; y: number };
 type SAM2Model = {
   id: string;
   label: string;
@@ -70,21 +70,34 @@ const colorPalette = [
   [112, 162, 64]
 ];
 
+function waitForNextPaint() {
+  return new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
 function App() {
   const [images, setImages] = useState<ImageSummary[]>([]);
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [tool, setTool] = useState<Tool>("sam_positive");
+  const [sam2Support, setSam2Support] = useState(false);
   const [brushSize, setBrushSize] = useState(8);
   const [zoom, setZoom] = useState(1);
   const [jumpValue, setJumpValue] = useState("1");
-  const [undoStack, setUndoStack] = useState<UndoItem[]>([]);
+  const [undoStacks, setUndoStacks] = useState<UndoStacks>({});
   const [status, setStatus] = useState("Loading");
-  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawingAction, setDrawingAction] = useState<DrawingAction | null>(null);
   const [dirtyIds, setDirtyIds] = useState<Set<number>>(new Set());
-  const [promptPoints, setPromptPoints] = useState<{ x: number; y: number; label: number }[]>([]);
   const [sam2Models, setSam2Models] = useState<SAM2Model[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("tiny");
+  const [blockingMessage, setBlockingMessage] = useState<string | null>(null);
+  const [cursorPoint, setCursorPoint] = useState<CanvasPoint | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -169,7 +182,34 @@ function App() {
       tinted.getContext("2d")?.putImageData(overlay, 0, 0);
       ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
     });
-  }, [detail, selectedId, zoom]);
+
+    if (cursorPoint) {
+      const scaleX = canvas.width / detail.width;
+      const scaleY = canvas.height / detail.height;
+      const x = cursorPoint.x * scaleX;
+      const y = cursorPoint.y * scaleY;
+      const radius = Math.max(1, (brushSize * scaleX) / 2);
+      const selectedIndex = detail.annotations.findIndex((annotation) => annotation.id === selectedId);
+      const selectedColor = selectedIndex >= 0 ? colorPalette[selectedIndex % colorPalette.length] : [31, 42, 48];
+      const pointerColor = `rgb(${selectedColor.join(",")})`;
+
+      ctx.save();
+      ctx.strokeStyle = pointerColor;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x - radius - 5, y);
+      ctx.lineTo(x - 2, y);
+      ctx.moveTo(x + 2, y);
+      ctx.lineTo(x + radius + 5, y);
+      ctx.moveTo(x, y - radius - 5);
+      ctx.lineTo(x, y - 2);
+      ctx.moveTo(x, y + 2);
+      ctx.lineTo(x, y + radius + 5);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }, [brushSize, cursorPoint, detail, sam2Support, selectedId, zoom]);
 
   const loadDetail = useCallback(
     async (index: number) => {
@@ -205,10 +245,8 @@ function App() {
       maskCanvases.current = nextMasks;
       setDetail(nextDetail);
       setSelectedId(nextDetail.annotations[0]?.id ?? null);
-      setPromptPoints([]);
       setJumpValue(String(nextDetail.index));
-      setZoom(1);
-      setUndoStack([]);
+      setUndoStacks({});
       dirtyIdsRef.current = new Set();
       setDirtyIds(new Set());
       setStatus("Ready");
@@ -255,7 +293,11 @@ function App() {
 
   const pushUndo = useCallback(
     (annotationId: number) => {
-      setUndoStack((prev) => [...prev, { annotationId, maskPng: canvasToMaskPng(annotationId) }]);
+      const maskPng = canvasToMaskPng(annotationId);
+      setUndoStacks((prev) => ({
+        ...prev,
+        [annotationId]: [...(prev[annotationId] ?? []), maskPng]
+      }));
     },
     [canvasToMaskPng]
   );
@@ -293,13 +335,13 @@ function App() {
     };
   }, [zoom]);
 
-  const eraseAt = useCallback(
-    (x: number, y: number) => {
+  const editMaskAt = useCallback(
+    (x: number, y: number, action: DrawingAction) => {
       if (!selectedId) return;
       const canvas = maskCanvases.current.get(selectedId);
       const ctx = canvas?.getContext("2d");
       if (!canvas || !ctx) return;
-      ctx.fillStyle = "black";
+      ctx.fillStyle = action === "paint" ? "white" : "black";
       ctx.beginPath();
       ctx.arc(x, y, Math.max(0.5, brushSize / 2), 0, Math.PI * 2);
       ctx.fill();
@@ -310,16 +352,14 @@ function App() {
   );
 
   const runSam2 = useCallback(
-    async (x: number, y: number, label: number) => {
+    async (x: number, y: number) => {
       if (!detail || !selectedId) return;
       pushUndo(selectedId);
-      const points = [...promptPoints, { x, y, label }];
-      setPromptPoints(points);
       setStatus("SAM2 predicting");
       const response = await fetch(`${API}/api/sam2/predict`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_index: detail.index, points, model_id: selectedModelId })
+        body: JSON.stringify({ image_index: detail.index, points: [{ x, y, label: 1 }], model_id: selectedModelId })
       });
       if (!response.ok) {
         const message = await response.text();
@@ -330,68 +370,147 @@ function App() {
       await replaceMask(selectedId, data.mask_png);
       setStatus("SAM2 mask updated");
     },
-    [detail, promptPoints, pushUndo, replaceMask, selectedId, selectedModelId]
+    [detail, pushUndo, replaceMask, selectedId, selectedModelId]
   );
 
   const selectSam2Model = useCallback(
     async (modelId: string) => {
-      setStatus(`Switching SAM2 model: ${modelId}`);
-      const response = await fetch(`${API}/api/sam2/models/select`, {
+      const targetModel = sam2Models.find((model) => model.id === modelId);
+      const shouldPrepare = sam2Support || !targetModel?.available;
+      const message = shouldPrepare ? `Downloading SAM2 model: ${modelId}` : `Switching SAM2 model: ${modelId}`;
+      setStatus(message);
+      if (shouldPrepare) {
+        flushSync(() => setBlockingMessage(message));
+        await waitForNextPaint();
+      }
+      try {
+        const responsePromise = fetch(`${API}/api/sam2/models/${shouldPrepare ? "prepare" : "select"}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: modelId })
+        });
+        const [response] = await Promise.all([responsePromise, shouldPrepare ? wait(500) : Promise.resolve()]);
+        if (!response.ok) {
+          setStatus(`SAM2 model error: ${await response.text()}`);
+          return;
+        }
+        const data = await response.json();
+        setSam2Models(data.models);
+        setSelectedModelId(data.current_model_id);
+        setStatus(sam2Support ? `SAM2 support ready: ${data.current_model_id}` : `SAM2 model ready: ${data.current_model_id}`);
+      } finally {
+        setBlockingMessage(null);
+      }
+    },
+    [sam2Models, sam2Support]
+  );
+
+  const toggleSam2Support = useCallback(async () => {
+    if (sam2Support) {
+      setSam2Support(false);
+      setStatus("SAM2 support off");
+      return;
+    }
+    const message = `Downloading SAM2 model: ${selectedModelId}`;
+    setStatus(message);
+    flushSync(() => setBlockingMessage(message));
+    await waitForNextPaint();
+    try {
+      const responsePromise = fetch(`${API}/api/sam2/models/prepare`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model_id: modelId })
+        body: JSON.stringify({ model_id: selectedModelId })
       });
+      const [response] = await Promise.all([responsePromise, wait(500)]);
       if (!response.ok) {
-        setStatus(`SAM2 model error: ${await response.text()}`);
+        setStatus(`SAM2 prepare error: ${await response.text()}`);
         return;
       }
       const data = await response.json();
       setSam2Models(data.models);
       setSelectedModelId(data.current_model_id);
-      setPromptPoints([]);
-      setStatus(`SAM2 model: ${data.current_model_id}`);
-    },
-    []
-  );
+      setSam2Support(true);
+      setStatus(`SAM2 support on: ${data.current_model_id}`);
+    } finally {
+      setBlockingMessage(null);
+    }
+  }, [sam2Support, selectedModelId]);
 
   const handlePointerDown = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
       if (!detail || !selectedId) return;
+      event.preventDefault();
       const point = canvasPoint(event);
-      if (tool === "eraser") {
+      if (event.button === 2) {
         pushUndo(selectedId);
-        setIsDrawing(true);
+        setDrawingAction("erase");
         event.currentTarget.setPointerCapture(event.pointerId);
-        eraseAt(point.x, point.y);
+        editMaskAt(point.x, point.y, "erase");
         return;
       }
-      runSam2(point.x, point.y, tool === "sam_positive" ? 1 : 0).catch((error) =>
-        setStatus(`SAM2 error: ${error.message}`)
-      );
+      if (event.button !== 0) return;
+      if (sam2Support) {
+        runSam2(point.x, point.y).catch((error) => setStatus(`SAM2 error: ${error.message}`));
+        return;
+      }
+      pushUndo(selectedId);
+      setDrawingAction("paint");
+      event.currentTarget.setPointerCapture(event.pointerId);
+      editMaskAt(point.x, point.y, "paint");
     },
-    [canvasPoint, detail, eraseAt, pushUndo, runSam2, selectedId, tool]
+    [canvasPoint, detail, editMaskAt, pushUndo, runSam2, sam2Support, selectedId]
   );
 
   const handlePointerMove = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
-      if (!isDrawing || tool !== "eraser") return;
       const point = canvasPoint(event);
-      eraseAt(point.x, point.y);
+      setCursorPoint(point);
+      if (!drawingAction) {
+        draw();
+        return;
+      }
+      editMaskAt(point.x, point.y, drawingAction);
     },
-    [canvasPoint, eraseAt, isDrawing, tool]
+    [canvasPoint, draw, drawingAction, editMaskAt]
   );
 
   const endDrawing = useCallback(() => {
-    setIsDrawing(false);
+    setDrawingAction(null);
   }, []);
 
   const undo = useCallback(async () => {
-    const last = undoStack[undoStack.length - 1];
+    if (!selectedId) return;
+    const stack = undoStacks[selectedId] ?? [];
+    const last = stack[stack.length - 1];
     if (!last) return;
-    setUndoStack((prev) => prev.slice(0, -1));
-    await replaceMask(last.annotationId, last.maskPng);
+    setUndoStacks((prev) => ({
+      ...prev,
+      [selectedId]: (prev[selectedId] ?? []).slice(0, -1)
+    }));
+    await replaceMask(selectedId, last);
     setStatus("Undo applied");
-  }, [replaceMask, undoStack]);
+  }, [replaceMask, selectedId, undoStacks]);
+
+  const resetAllMaskEdits = useCallback(async () => {
+    const ok = window.confirm(
+      "すべてのマスク編集履歴を初期化し、入力 COCO JSON の状態に戻します。未保存の編集と新規インスタンスは破棄されます。この操作は取り消せません。実行しますか？"
+    );
+    if (!ok) return;
+    setStatus("Resetting mask edits");
+    const currentIndex = detail?.index ?? 1;
+    const response = await fetch(`${API}/api/reset-edits`, { method: "POST" });
+    if (!response.ok) {
+      setStatus(`Reset error: ${await response.text()}`);
+      return;
+    }
+    maskCanvases.current = new Map();
+    dirtyIdsRef.current = new Set();
+    setUndoStacks({});
+    setDirtyIds(new Set());
+    await loadImages();
+    await loadDetail(currentIndex);
+    setStatus("Mask edits reset");
+  }, [detail?.index, loadDetail, loadImages]);
 
   const addInstance = useCallback(async () => {
     if (!detail) return;
@@ -413,7 +532,6 @@ function App() {
     setDetail({ ...detail, image_id: annotation.image_id, annotations: [...detail.annotations, annotation] });
     setSelectedId(annotation.id);
     markDirty(annotation.id);
-    setPromptPoints([]);
     setStatus("New instance created");
   }, [detail, markDirty]);
 
@@ -437,6 +555,7 @@ function App() {
   );
 
   const selectedColor = detail?.annotations.findIndex((annotation) => annotation.id === selectedId) ?? -1;
+  const selectedUndoCount = selectedId ? undoStacks[selectedId]?.length ?? 0 : 0;
 
   return (
     <main className="app">
@@ -465,17 +584,18 @@ function App() {
           <span>{detail ? `${detail.index} / ${images.length}` : ""}</span>
         </div>
         <section className="tools">
-          <button className={tool === "sam_positive" ? "active" : ""} title="SAM2 positive point" onClick={() => setTool("sam_positive")}>
-            <CirclePlus size={18} />
+          <button
+            className={sam2Support ? "active" : ""}
+            title="SAM2 support toggle"
+            onClick={() => toggleSam2Support().catch((error) => setStatus(`SAM2 prepare error: ${error.message}`))}
+          >
+            <Sparkles size={18} />
           </button>
-          <button className={tool === "sam_negative" ? "active" : ""} title="SAM2 negative point" onClick={() => setTool("sam_negative")}>
-            <CircleMinus size={18} />
-          </button>
-          <button className={tool === "eraser" ? "active" : ""} title="Eraser" onClick={() => setTool("eraser")}>
-            <Eraser size={18} />
-          </button>
-          <button title="Undo" onClick={undo} disabled={undoStack.length === 0}>
+          <button title="Undo" onClick={undo} disabled={selectedUndoCount === 0}>
             <RotateCcw size={18} />
+          </button>
+          <button title="Reset all mask edits" onClick={() => resetAllMaskEdits().catch((error) => setStatus(`Reset error: ${error.message}`))}>
+            <Trash2 size={18} />
           </button>
           <button title="Add instance" onClick={addInstance}>
             <Plus size={18} />
@@ -505,10 +625,7 @@ function App() {
               <button
                 key={annotation.id}
                 className={annotation.id === selectedId ? "instance active" : "instance"}
-                onClick={() => {
-                  setSelectedId(annotation.id);
-                  setPromptPoints([]);
-                }}
+                onClick={() => setSelectedId(annotation.id)}
               >
                 <span className="swatch" style={{ backgroundColor: `rgb(${color.join(",")})` }} />
                 <span>#{annotation.id}</span>
@@ -532,6 +649,11 @@ function App() {
             onPointerMove={handlePointerMove}
             onPointerUp={endDrawing}
             onPointerCancel={endDrawing}
+            onPointerLeave={() => {
+              setCursorPoint(null);
+              endDrawing();
+            }}
+            onContextMenu={(event) => event.preventDefault()}
             onWheel={(event) => {
               event.preventDefault();
               const factor = event.deltaY < 0 ? 1.12 : 0.88;
@@ -545,6 +667,15 @@ function App() {
           <span>{selectedColor >= 0 ? `Color ${selectedColor + 1}` : ""}</span>
         </div>
       </section>
+      {blockingMessage && (
+        <div className="blocking-overlay" role="alert" aria-live="assertive">
+          <div className="blocking-panel">
+            <Sparkles size={22} />
+            <strong>{blockingMessage}</strong>
+            <span>しばらくお待ちください。</span>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

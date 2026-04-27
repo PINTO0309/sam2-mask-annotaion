@@ -48,6 +48,17 @@ class SAM2Service:
             self._reset_predictor()
         return self.list_models()
 
+    def prepare_model(self, model_id: str | None = None) -> dict[str, object]:
+        if model_id:
+            self.select_model(model_id)
+        checkpoint_path = self.ensure_checkpoint(self.current_model_id)
+        return {
+            "current_model_id": self.current_model_id,
+            "checkpoint_path": str(checkpoint_path),
+            "available": checkpoint_path.exists(),
+            "models": self.list_models()["models"],
+        }
+
     def ensure_checkpoint(self, model_id: str | None = None) -> Path:
         spec = self._spec(model_id or self.current_model_id)
         checkpoint_path = spec["checkpoint_path"]
