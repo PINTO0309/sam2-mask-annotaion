@@ -29,13 +29,118 @@ class COCOStore:
     def __init__(self, coco_path: Path, images_dir: Path, output_path: Path):
         self.coco_path = coco_path
         self.images_dir = images_dir
+        self._default_output_path = output_path
         self.output_path = output_path
-        self.reload()
+        self.source_name = coco_path.name
+        with self.coco_path.open("r", encoding="utf-8") as fh:
+            source_data: dict[str, Any] = json.load(fh)
+        self.open_data(source_data, self.coco_path.name, self._default_output_path)
 
     def reload(self) -> None:
-        with self.coco_path.open("r", encoding="utf-8") as fh:
-            self.data: dict[str, Any] = json.load(fh)
+        self._load_data(copy.deepcopy(self._source_data))
 
+    def open_data(self, data: dict[str, Any], source_name: str, output_path: Path | None = None) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("annotation data must be a JSON object")
+        self._validate_source_name(source_name)
+        self._validate_coco_data(data)
+        self.source_name = Path(source_name).name or self.coco_path.name
+        self.output_path = output_path or self._output_path_for_source(self.source_name)
+        self._source_data = copy.deepcopy(data)
+        self._load_data(copy.deepcopy(data))
+        return {
+            "source_name": self.source_name,
+            "output_path": str(self.output_path),
+            "image_count": len(self.entries),
+        }
+
+    def _output_path_for_source(self, source_name: str) -> Path:
+        stem = Path(source_name).stem or self.coco_path.stem
+        return self._default_output_path.parent / f"{stem}.corrected.json"
+
+    @staticmethod
+    def _validate_source_name(source_name: str) -> None:
+        if Path(source_name).suffix.lower() != ".json":
+            raise ValueError("annotation file must have a .json extension")
+
+    @staticmethod
+    def _validate_coco_data(data: dict[str, Any]) -> None:
+        for key in ("images", "annotations", "categories"):
+            if key not in data:
+                raise ValueError(f"annotation data is not COCO format: missing required key '{key}'")
+            if not isinstance(data[key], list):
+                raise ValueError(f"annotation data is not COCO format: '{key}' must be a list")
+
+        image_ids: set[int] = set()
+        for idx, image in enumerate(data["images"]):
+            if not isinstance(image, dict):
+                raise ValueError(f"annotation data is not COCO format: images[{idx}] must be an object")
+            for key in ("id", "file_name"):
+                if key not in image:
+                    raise ValueError(f"annotation data is not COCO format: images[{idx}] missing '{key}'")
+            image_id = COCOStore._int_field(image["id"], f"images[{idx}].id")
+            if image_id in image_ids:
+                raise ValueError(f"annotation data is not COCO format: duplicate image id {image_id}")
+            image_ids.add(image_id)
+            if not isinstance(image["file_name"], str) or not image["file_name"]:
+                raise ValueError(f"annotation data is not COCO format: images[{idx}].file_name must be a non-empty string")
+
+        category_ids: set[int] = set()
+        for idx, category in enumerate(data["categories"]):
+            if not isinstance(category, dict):
+                raise ValueError(f"annotation data is not COCO format: categories[{idx}] must be an object")
+            if "id" not in category:
+                raise ValueError(f"annotation data is not COCO format: categories[{idx}] missing 'id'")
+            category_id = COCOStore._int_field(category["id"], f"categories[{idx}].id")
+            if category_id in category_ids:
+                raise ValueError(f"annotation data is not COCO format: duplicate category id {category_id}")
+            category_ids.add(category_id)
+
+        annotation_ids: set[int] = set()
+        for idx, annotation in enumerate(data["annotations"]):
+            if not isinstance(annotation, dict):
+                raise ValueError(f"annotation data is not COCO format: annotations[{idx}] must be an object")
+            for key in ("id", "image_id", "category_id", "segmentation", "area", "bbox"):
+                if key not in annotation:
+                    raise ValueError(f"annotation data is not COCO format: annotations[{idx}] missing '{key}'")
+            annotation_id = COCOStore._int_field(annotation["id"], f"annotations[{idx}].id")
+            if annotation_id in annotation_ids:
+                raise ValueError(f"annotation data is not COCO format: duplicate annotation id {annotation_id}")
+            annotation_ids.add(annotation_id)
+            image_id = COCOStore._int_field(annotation["image_id"], f"annotations[{idx}].image_id")
+            if image_id not in image_ids:
+                raise ValueError(f"annotation data is not COCO format: annotations[{idx}].image_id does not reference an image")
+            category_id = COCOStore._int_field(annotation["category_id"], f"annotations[{idx}].category_id")
+            if category_ids and category_id not in category_ids:
+                raise ValueError(f"annotation data is not COCO format: annotations[{idx}].category_id does not reference a category")
+            COCOStore._validate_rle(annotation["segmentation"], f"annotations[{idx}].segmentation")
+            if not isinstance(annotation["bbox"], list) or len(annotation["bbox"]) != 4:
+                raise ValueError(f"annotation data is not COCO format: annotations[{idx}].bbox must be a 4-value list")
+            if not isinstance(annotation["area"], int | float):
+                raise ValueError(f"annotation data is not COCO format: annotations[{idx}].area must be a number")
+
+    @staticmethod
+    def _int_field(value: Any, field_name: str) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"annotation data is not COCO format: {field_name} must be an integer") from exc
+
+    @staticmethod
+    def _validate_rle(segmentation: Any, field_name: str) -> None:
+        if not isinstance(segmentation, dict):
+            raise ValueError(f"annotation data is not supported COCO RLE format: {field_name} must be an RLE object")
+        if "size" not in segmentation or "counts" not in segmentation:
+            raise ValueError(f"annotation data is not supported COCO RLE format: {field_name} must contain 'size' and 'counts'")
+        size = segmentation["size"]
+        counts = segmentation["counts"]
+        if not isinstance(size, list) or len(size) != 2:
+            raise ValueError(f"annotation data is not supported COCO RLE format: {field_name}.size must be a 2-value list")
+        if not isinstance(counts, str | list):
+            raise ValueError(f"annotation data is not supported COCO RLE format: {field_name}.counts must be a string or list")
+
+    def _load_data(self, data: dict[str, Any]) -> None:
+        self.data = data
         self.images: list[dict[str, Any]] = self.data.setdefault("images", [])
         self.annotations: list[dict[str, Any]] = self.data.setdefault("annotations", [])
         self.categories: list[dict[str, Any]] = self.data.setdefault("categories", [])
@@ -163,9 +268,14 @@ class COCOStore:
         ann = self._annotation_by_id[annotation_id]
         ann["segmentation"] = mask_to_compact_rle(mask)
         ann["area"] = mask_area(mask)
-        if annotation_id not in self._original_annotation_ids:
-            ann["bbox"] = mask_bbox(mask)
         return self.annotation_response(ann)
+
+    def delete_annotation(self, annotation_id: int) -> dict[str, Any]:
+        ann = self._annotation_by_id.pop(annotation_id)
+        self.annotations = [item for item in self.annotations if int(item["id"]) != annotation_id]
+        self.data["annotations"] = self.annotations
+        self._rebuild_annotation_index()
+        return {"deleted_id": int(ann["id"]), "image_id": int(ann["image_id"])}
 
     def annotation_response(self, ann: dict[str, Any]) -> dict[str, Any]:
         mask = compact_rle_to_mask(ann["segmentation"])

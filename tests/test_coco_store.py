@@ -36,3 +36,27 @@ def test_new_annotation_on_extra_image_adds_image_and_computed_bbox(sample_store
     assert saved["annotations"][1]["bbox"] == [1.0, 2.0, 3.0, 3.0]
     assert saved["annotations"][1]["area"] == 9.0
     assert isinstance(saved["annotations"][1]["segmentation"]["counts"], str)
+
+
+def test_new_annotation_bbox_is_preserved_on_mask_update(sample_store):
+    initial = np.zeros((5, 6), dtype=bool)
+    initial[2:5, 1:4] = True
+    annotation = sample_store.create_instance(2, initial)
+
+    replacement = np.zeros((5, 6), dtype=bool)
+    replacement[0:1, 0:2] = True
+    sample_store.update_mask(annotation["id"], replacement)
+    sample_store.save()
+    saved = json.loads(sample_store.output_path.read_text(encoding="utf-8"))
+
+    assert saved["annotations"][1]["bbox"] == [1.0, 2.0, 3.0, 3.0]
+    assert saved["annotations"][1]["area"] == 2.0
+
+
+def test_delete_annotation_removes_it_from_saved_coco(sample_store):
+    result = sample_store.delete_annotation(10)
+    sample_store.save()
+    saved = json.loads(sample_store.output_path.read_text(encoding="utf-8"))
+
+    assert result == {"deleted_id": 10, "image_id": 1}
+    assert saved["annotations"] == []

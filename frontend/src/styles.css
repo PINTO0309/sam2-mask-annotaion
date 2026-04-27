@@ -91,7 +91,7 @@ button.active {
 }
 
 .tools {
-  grid-template-columns: repeat(4, 34px);
+  grid-template-columns: repeat(5, 34px);
 }
 
 .model-options {
@@ -106,12 +106,16 @@ button.active {
 }
 
 .actions {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   margin-top: auto;
 }
 
 .actions button {
   width: 100%;
+}
+
+.hidden-file-input {
+  display: none;
 }
 
 .nav-row input {
@@ -146,6 +150,44 @@ button.active {
 
 .slider strong {
   text-align: right;
+}
+
+.legend {
+  border-top: 1px solid #edf0ee;
+  display: grid;
+  gap: 6px;
+  padding-top: 12px;
+}
+
+.legend h2 {
+  color: #435057;
+  font-size: 12px;
+  letter-spacing: 0;
+  margin: 0 0 2px;
+}
+
+.legend div {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 106px 1fr;
+}
+
+.legend kbd {
+  background: #f4f6f5;
+  border: 1px solid #cfd7d3;
+  border-radius: 4px;
+  color: #1f2a30;
+  font-size: 11px;
+  font-family: inherit;
+  min-height: 22px;
+  padding: 3px 5px;
+  text-align: center;
+}
+
+.legend span {
+  color: #58656d;
+  font-size: 12px;
 }
 
 .instances {
@@ -194,6 +236,16 @@ button.active {
   grid-template-rows: 1fr 36px;
   min-height: 0;
   min-width: 0;
+}
+
+.workspace.panning,
+.workspace.panning .image-canvas {
+  cursor: grab;
+}
+
+.workspace.panning:active,
+.workspace.panning:active .image-canvas {
+  cursor: grabbing;
 }
 
 .canvas-shell {

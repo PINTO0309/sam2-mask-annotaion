@@ -7,9 +7,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Download,
+  FolderOpen,
   Plus,
   RotateCcw,
   Trash2,
+  UserMinus,
   Save,
   Sparkles
 } from "lucide-react";
@@ -49,6 +51,8 @@ type ImageDetail = {
 type DrawingAction = "paint" | "erase";
 type UndoStacks = Record<number, string[]>;
 type CanvasPoint = { x: number; y: number };
+type PanOffset = { x: number; y: number };
+type PanState = { pointerId: number; clientX: number; clientY: number; offset: PanOffset };
 type SAM2Model = {
   id: string;
   label: string;
@@ -87,7 +91,7 @@ function App() {
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [sam2Support, setSam2Support] = useState(false);
-  const [brushSize, setBrushSize] = useState(8);
+  const [brushSize, setBrushSize] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [jumpValue, setJumpValue] = useState("1");
   const [undoStacks, setUndoStacks] = useState<UndoStacks>({});
@@ -98,10 +102,15 @@ function App() {
   const [selectedModelId, setSelectedModelId] = useState("tiny");
   const [blockingMessage, setBlockingMessage] = useState<string | null>(null);
   const [cursorPoint, setCursorPoint] = useState<CanvasPoint | null>(null);
+  const [panOffset, setPanOffset] = useState<PanOffset>({ x: 0, y: 0 });
+  const [ctrlPressed, setCtrlPressed] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const workspaceRef = useRef<HTMLElement | null>(null);
+  const annotationFileInputRef = useRef<HTMLInputElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const maskCanvases = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  const panStateRef = useRef<PanState | null>(null);
   const dirtyIdsRef = useRef<Set<number>>(new Set());
   const syncDirtyMasksRef = useRef<() => Promise<void>>(async () => {});
 
@@ -115,6 +124,25 @@ function App() {
     if (!response.ok) throw new Error(await response.text());
     const data = await response.json();
     setImages(data.images);
+    return data.images as ImageSummary[];
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Control") setCtrlPressed(true);
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "Control") setCtrlPressed(false);
+    };
+    const handleBlur = () => setCtrlPressed(false);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
   }, []);
 
   const loadSam2Models = useCallback(async () => {
@@ -212,10 +240,10 @@ function App() {
   }, [brushSize, cursorPoint, detail, sam2Support, selectedId, zoom]);
 
   const loadDetail = useCallback(
-    async (index: number) => {
+    async (index: number, imageCount = images.length) => {
       setStatus("Loading image");
       await syncDirtyMasksRef.current();
-      const clamped = Math.min(Math.max(index, 1), Math.max(images.length, 1));
+      const clamped = Math.min(Math.max(index, 1), Math.max(imageCount, 1));
       const response = await fetch(`${API}/api/images/${clamped}`);
       if (!response.ok) throw new Error(await response.text());
       const nextDetail: ImageDetail = await response.json();
@@ -436,9 +464,85 @@ function App() {
     }
   }, [sam2Support, selectedModelId]);
 
+  const startPan = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || !event.ctrlKey) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    panStateRef.current = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      offset: panOffset
+    };
+    setCursorPoint(null);
+    setDrawingAction(null);
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Window-level listeners below keep pan working even if capture is unavailable.
+    }
+    setStatus("Pan");
+    return true;
+  }, [panOffset]);
+
+  useEffect(() => {
+    const handleWindowPointerMove = (event: PointerEvent) => {
+      if (!panStateRef.current) return;
+      event.preventDefault();
+      const deltaX = event.clientX - panStateRef.current.clientX;
+      const deltaY = event.clientY - panStateRef.current.clientY;
+      setPanOffset({
+        x: panStateRef.current.offset.x + deltaX,
+        y: panStateRef.current.offset.y + deltaY
+      });
+    };
+    const handleWindowPointerUp = () => {
+      panStateRef.current = null;
+    };
+    window.addEventListener("pointermove", handleWindowPointerMove, { passive: false });
+    window.addEventListener("pointerup", handleWindowPointerUp);
+    window.addEventListener("pointercancel", handleWindowPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handleWindowPointerMove);
+      window.removeEventListener("pointerup", handleWindowPointerUp);
+      window.removeEventListener("pointercancel", handleWindowPointerUp);
+    };
+  }, []);
+
+  const panCanvas = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (!panStateRef.current) return false;
+    const deltaX = event.clientX - panStateRef.current.clientX;
+    const deltaY = event.clientY - panStateRef.current.clientY;
+    setPanOffset({
+      x: panStateRef.current.offset.x + deltaX,
+      y: panStateRef.current.offset.y + deltaY
+    });
+    return true;
+  }, []);
+
+  const handleWorkspacePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      if (startPan(event)) {
+        event.stopPropagation();
+      }
+    },
+    [startPan]
+  );
+
+  const handleWorkspacePointerMove = useCallback(
+    (event: React.PointerEvent<HTMLElement>) => {
+      if (panCanvas(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    [panCanvas]
+  );
+
   const handlePointerDown = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
       if (!detail || !selectedId) return;
+      if (startPan(event)) return;
       event.preventDefault();
       const point = canvasPoint(event);
       if (event.button === 2) {
@@ -458,11 +562,12 @@ function App() {
       event.currentTarget.setPointerCapture(event.pointerId);
       editMaskAt(point.x, point.y, "paint");
     },
-    [canvasPoint, detail, editMaskAt, pushUndo, runSam2, sam2Support, selectedId]
+    [canvasPoint, detail, editMaskAt, pushUndo, runSam2, sam2Support, selectedId, startPan]
   );
 
   const handlePointerMove = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (panCanvas(event)) return;
       const point = canvasPoint(event);
       setCursorPoint(point);
       if (!drawingAction) {
@@ -471,11 +576,27 @@ function App() {
       }
       editMaskAt(point.x, point.y, drawingAction);
     },
-    [canvasPoint, draw, drawingAction, editMaskAt]
+    [canvasPoint, draw, drawingAction, editMaskAt, panCanvas]
   );
 
   const endDrawing = useCallback(() => {
+    panStateRef.current = null;
     setDrawingAction(null);
+  }, []);
+
+  useEffect(() => {
+    const workspace = workspaceRef.current;
+    if (!workspace) return;
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 0.88;
+      setZoom((value) => Math.min(12, Math.max(0.15, value * factor)));
+    };
+    workspace.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      workspace.removeEventListener("wheel", handleWheel);
+    };
   }, []);
 
   const undo = useCallback(async () => {
@@ -493,7 +614,7 @@ function App() {
 
   const resetAllMaskEdits = useCallback(async () => {
     const ok = window.confirm(
-      "すべてのマスク編集履歴を初期化し、入力 COCO JSON の状態に戻します。未保存の編集と新規インスタンスは破棄されます。この操作は取り消せません。実行しますか？"
+      "Reset all mask edits and restore the input COCO JSON state? Unsaved edits and new instances will be discarded. This action cannot be undone."
     );
     if (!ok) return;
     setStatus("Resetting mask edits");
@@ -535,6 +656,33 @@ function App() {
     setStatus("New instance created");
   }, [detail, markDirty]);
 
+  const deleteSelectedInstance = useCallback(async () => {
+    if (!detail || !selectedId) return;
+    const ok = window.confirm(`Delete selected instance #${selectedId}? This change will be written to the corrected JSON when you save.`);
+    if (!ok) return;
+    const response = await fetch(`${API}/api/annotations/${selectedId}`, { method: "DELETE" });
+    if (!response.ok) {
+      setStatus(`Delete error: ${await response.text()}`);
+      return;
+    }
+    const nextAnnotations = detail.annotations.filter((annotation) => annotation.id !== selectedId);
+    maskCanvases.current.delete(selectedId);
+    dirtyIdsRef.current.delete(selectedId);
+    setDirtyIds((prev) => {
+      const next = new Set(prev);
+      next.delete(selectedId);
+      return next;
+    });
+    setUndoStacks((prev) => {
+      const next = { ...prev };
+      delete next[selectedId];
+      return next;
+    });
+    setDetail({ ...detail, annotations: nextAnnotations });
+    setSelectedId(nextAnnotations[0]?.id ?? null);
+    setStatus(`Instance #${selectedId} deleted`);
+  }, [detail, selectedId]);
+
   const save = useCallback(
     async (download: boolean) => {
       setStatus("Saving");
@@ -552,6 +700,60 @@ function App() {
       }
     },
     [syncDirtyMasks]
+  );
+
+  const openAnnotationFile = useCallback(
+    async (file: File) => {
+      if (!file.name.toLowerCase().endsWith(".json")) {
+        setStatus("Open error: annotation file must have a .json extension");
+        return;
+      }
+      const ok = window.confirm(
+        "Open the selected annotation file and discard the current workspace state? Unsaved edits will be lost."
+      );
+      if (!ok) return;
+      setStatus(`Opening annotation: ${file.name}`);
+      try {
+        const text = await file.text();
+        let data: unknown;
+        try {
+          data = JSON.parse(text);
+        } catch (error) {
+          throw new Error(`JSON parse error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          throw new Error("annotation file must be a COCO JSON object");
+        }
+        const response = await fetch(`${API}/api/annotations/open`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_name: file.name, data })
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          let message = text;
+          try {
+            const parsed = JSON.parse(text);
+            message = parsed.detail ?? text;
+          } catch {
+            // Keep the raw response text when the server did not return JSON.
+          }
+          throw new Error(message);
+        }
+        maskCanvases.current = new Map();
+        dirtyIdsRef.current = new Set();
+        setUndoStacks({});
+        setDirtyIds(new Set());
+        setSelectedId(null);
+        setCursorPoint(null);
+        const nextImages = await loadImages();
+        await loadDetail(1, nextImages.length);
+        setStatus(`Opened: ${file.name}`);
+      } catch (error) {
+        setStatus(`Open error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [loadDetail, loadImages]
   );
 
   const selectedColor = detail?.annotations.findIndex((annotation) => annotation.id === selectedId) ?? -1;
@@ -597,6 +799,9 @@ function App() {
           <button title="Reset all mask edits" onClick={() => resetAllMaskEdits().catch((error) => setStatus(`Reset error: ${error.message}`))}>
             <Trash2 size={18} />
           </button>
+          <button title="Delete selected instance" onClick={() => deleteSelectedInstance().catch((error) => setStatus(`Delete error: ${error.message}`))} disabled={!selectedId}>
+            <UserMinus size={18} />
+          </button>
           <button title="Add instance" onClick={addInstance}>
             <Plus size={18} />
           </button>
@@ -618,6 +823,14 @@ function App() {
           <input min={1} max={80} type="range" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
           <strong>{brushSize}px</strong>
         </label>
+        <section className="legend" aria-label="mouse controls">
+          <h2>Mouse</h2>
+          <div><kbd>Left drag</kbd><span>Paint mask</span></div>
+          <div><kbd>Right drag</kbd><span>Erase mask</span></div>
+          <div><kbd>Ctrl + drag</kbd><span>Pan image</span></div>
+          <div><kbd>Ctrl + wheel</kbd><span>Zoom image</span></div>
+          <div><kbd>SAM2 ON + left</kbd><span>SAM2 assist</span></div>
+        </section>
         <section className="instances">
           {detail?.annotations.map((annotation, idx) => {
             const color = colorPalette[idx % colorPalette.length];
@@ -635,30 +848,49 @@ function App() {
           })}
         </section>
         <div className="actions">
+          <input
+            ref={annotationFileInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden-file-input"
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              event.currentTarget.value = "";
+              if (file) {
+                openAnnotationFile(file).catch((error) => setStatus(`Open error: ${error.message}`));
+              }
+            }}
+          />
+          <button title="Open annotation JSON" onClick={() => annotationFileInputRef.current?.click()}><FolderOpen size={18} /></button>
           <button title="Save" onClick={() => save(false)}><Save size={18} /></button>
           <button title="Save and download" onClick={() => save(true)}><Download size={18} /></button>
         </div>
         <p className="status">{status}</p>
       </aside>
-      <section className="workspace">
+      <section
+        ref={workspaceRef}
+        className={ctrlPressed || panStateRef.current ? "workspace panning" : "workspace"}
+        onPointerDownCapture={handleWorkspacePointerDown}
+        onPointerMoveCapture={handleWorkspacePointerMove}
+        onPointerUp={endDrawing}
+        onPointerCancel={endDrawing}
+      >
         <div className="canvas-shell">
           <canvas
             ref={canvasRef}
             className="image-canvas"
+            style={{ transform: `translate(${panOffset.x}px, ${panOffset.y}px)` }}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={endDrawing}
             onPointerCancel={endDrawing}
             onPointerLeave={() => {
               setCursorPoint(null);
-              endDrawing();
+              if (!panStateRef.current) {
+                endDrawing();
+              }
             }}
             onContextMenu={(event) => event.preventDefault()}
-            onWheel={(event) => {
-              event.preventDefault();
-              const factor = event.deltaY < 0 ? 1.12 : 0.88;
-              setZoom((value) => Math.min(12, Math.max(0.15, value * factor)));
-            }}
           />
         </div>
         <div className="footer-bar">
@@ -672,7 +904,7 @@ function App() {
           <div className="blocking-panel">
             <Sparkles size={22} />
             <strong>{blockingMessage}</strong>
-            <span>しばらくお待ちください。</span>
+            <span>Please wait.</span>
           </div>
         </div>
       )}

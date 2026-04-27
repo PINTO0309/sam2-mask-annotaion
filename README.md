@@ -1,18 +1,22 @@
 # sam2-mask-annotaion
 
-`datasets/annotations/wholebody48_person_body_coco.json` と `datasets/images/` を入力として使う、ブラウザベースの COCO インスタンスマスク補正ツールです。
+A browser-based COCO instance mask correction tool that uses `datasets/annotations/wholebody48_person_body_coco.json` and the images under `datasets/images/`.
 
-## 機能
+## Features
 
-- FastAPI バックエンドと React/Vite フロントエンドで構成されています。
-- `pycocotools` を使って COCO Compact RLE をデコード/エンコードします。
-- インスタンスごとに異なる色でマスクをオーバーレイ表示します。
-- SAM2.1 による補助補正、UI 上での SAM2 モデル切り替え、1 px まで指定できるブラシ編集、UNDO、マウスホイールでのズーム、画像移動、インデックス指定ジャンプに対応しています。通常時は左クリック/ドラッグでマスクを塗り、右クリック/ドラッグでマスクを除去します。SAM2 サポートトグルが ON のときは、左クリックで SAM2 補助を実行します。
-- 全マスク編集を入力 COCO JSON の状態へ戻す初期化ボタンを備えています。実行前には確認ダイアログを表示します。
-- 補正後のデータは `datasets/annotations/wholebody48_person_body_coco.corrected.json` に保存でき、同じ JSON をブラウザからダウンロードできます。
-- 既存アノテーションの `bbox` は保持し、新規インスタンスのみ編集後のマスクから `bbox` と `area` を計算します。
+- FastAPI backend with a React/Vite frontend.
+- Decodes and encodes COCO Compact RLE masks with `pycocotools`.
+- Displays mask overlays with a different color per instance.
+- Supports SAM2.1-assisted correction, SAM2 model switching from the UI, 1 px brush editing, undo, Ctrl + wheel zoom, image navigation, and index-based image jumping.
+- In normal mode, left click or drag paints the mask, and right click or drag erases it. When the SAM2 support toggle is on, left click runs SAM2 assistance.
+- Supports deleting the selected instance. A confirmation dialog is shown before deletion.
+- Includes a reset button that restores all mask edits to the input COCO JSON state. A confirmation dialog is shown before reset.
+- The folder button to the left of the save button opens another COCO annotation JSON file. Because this discards the current workspace state, a confirmation dialog is shown before loading.
+- Corrected data can be saved to `datasets/annotations/wholebody48_person_body_coco.corrected.json`, and the same JSON can be downloaded from the browser.
+- When another annotation JSON is opened, the save target becomes `datasets/annotations/<opened-file-name>.corrected.json`.
+- During mask editing, only `area` is recalculated. `bbox` is preserved for both existing and new instances.
 
-## セットアップ
+## Setup
 
 ```bash
 uv venv .venv --python 3.10
@@ -24,38 +28,41 @@ cd frontend
 pnpm install
 ```
 
-デフォルトでは `sam2.1_hiera_tiny.pt` を使います。UI から `Tiny`、`Small`、`Base+`、`Large` を選択でき、未取得の checkpoint は SAM2 サポートトグルを ON にした時点で自動ダウンロードされます。SAM2 サポートが ON の状態でモデルを切り替えた場合も、そのモデルの checkpoint を準備します。事前に取得する場合は次のように実行してください。
+The default model is `sam2.1_hiera_tiny.pt`. The UI can switch between `Tiny`, `Small`, `Base+`, and `Large`. Missing checkpoints are downloaded automatically when the SAM2 support toggle is turned on. If SAM2 support is already on and you switch models, the selected checkpoint is prepared as part of that switch.
+
+To download checkpoints ahead of time, run:
 
 ```bash
 python scripts/setup_sam2.py --model tiny
 python scripts/setup_sam2.py --model all
 ```
 
-checkpoint ディレクトリやデフォルトモデルを変更する場合は、次の環境変数を設定してください。
+To change the checkpoint directory or default model, set these environment variables:
 
 ```bash
 export SAM2_CHECKPOINT_DIR=/path/to/checkpoints
 export SAM2_DEFAULT_MODEL_ID=small
 ```
 
-## 起動
+## Run
 
-セットアップ後は、次のワンライナーでバックエンドとフロントエンドを同時に起動できます。
+After setup, start both the backend and frontend with:
 
 ```bash
 ./scripts/dev.sh
 ```
 
-ブラウザで `http://127.0.0.1:8999` を開いてください。
-同じリポジトリから起動した既存の dev server が対象ポートを使用している場合は、自動で停止してから起動し直します。
+Open `http://127.0.0.1:8999` in your browser.
 
-ポートを変更する場合は環境変数を指定します。
+If an existing dev server from this repository is already using the target ports, the script stops it and starts a fresh one.
+
+To override the ports, set environment variables:
 
 ```bash
 BACKEND_PORT=8010 FRONTEND_PORT=9000 ./scripts/dev.sh
 ```
 
-個別に起動する場合は次のコマンドを使います。
+To run the services separately:
 
 ```bash
 source .venv/bin/activate
@@ -65,7 +72,7 @@ cd frontend
 pnpm run dev
 ```
 
-## テスト
+## Test
 
 ```bash
 source .venv/bin/activate

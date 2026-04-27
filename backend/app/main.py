@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +36,11 @@ class SAM2PredictPayload(BaseModel):
 
 class SAM2SelectModelPayload(BaseModel):
     model_id: str
+
+
+class OpenAnnotationPayload(BaseModel):
+    file_name: str
+    data: dict[str, Any]
 
 
 def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None = None) -> FastAPI:
@@ -73,6 +80,14 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return FileResponse(path)
 
+    @app.post("/api/annotations/open")
+    def open_annotation_file(payload: OpenAnnotationPayload):
+        try:
+            result = app.state.store.open_data(payload.data, payload.file_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, **result}
+
     @app.post("/api/images/{index}/instances")
     def create_instance(index: int, payload: CreateInstancePayload):
         try:
@@ -90,6 +105,13 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
         try:
             mask = png_data_url_to_mask(payload.mask_png)
             return app.state.store.update_mask(annotation_id, mask)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"annotation not found: {annotation_id}") from exc
+
+    @app.delete("/api/annotations/{annotation_id}")
+    def delete_annotation(annotation_id: int):
+        try:
+            return app.state.store.delete_annotation(annotation_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"annotation not found: {annotation_id}") from exc
 
