@@ -14,18 +14,20 @@
 ## セットアップ
 
 ```bash
-uv sync --dev --extra sam2
-uv run python scripts/setup_sam2.py
+uv venv .venv --python 3.10
+source .venv/bin/activate
+uv sync --active --dev --extra sam2
+python scripts/setup_sam2.py
 
 cd frontend
-npm install
+pnpm install
 ```
 
 デフォルトでは `sam2.1_hiera_tiny.pt` を使います。UI から `Tiny`、`Small`、`Base+`、`Large` を選択でき、未取得の checkpoint は選択後の初回推論時に自動ダウンロードされます。事前に取得する場合は次のように実行してください。
 
 ```bash
-uv run python scripts/setup_sam2.py --model tiny
-uv run python scripts/setup_sam2.py --model all
+python scripts/setup_sam2.py --model tiny
+python scripts/setup_sam2.py --model all
 ```
 
 checkpoint ディレクトリやデフォルトモデルを変更する場合は、次の環境変数を設定してください。
@@ -40,14 +42,15 @@ export SAM2_DEFAULT_MODEL_ID=small
 ターミナル 1:
 
 ```bash
-uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+source .venv/bin/activate
+uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 ターミナル 2:
 
 ```bash
 cd frontend
-npm run dev
+pnpm run dev
 ```
 
 ブラウザで `http://127.0.0.1:5173` を開いてください。
@@ -55,7 +58,8 @@ npm run dev
 ## テスト
 
 ```bash
-uv run pytest
+source .venv/bin/activate
+pytest
 cd frontend
-npm run build
+pnpm run build
 ```
