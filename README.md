@@ -14,10 +14,8 @@
 ## セットアップ
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev,sam2]'
-python scripts/setup_sam2.py
+uv sync --dev --extra sam2
+uv run python scripts/setup_sam2.py
 
 cd frontend
 npm install
@@ -35,8 +33,7 @@ export SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_t.yaml
 ターミナル 1:
 
 ```bash
-source .venv/bin/activate
-uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
+uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 ターミナル 2:
@@ -51,8 +48,7 @@ npm run dev
 ## テスト
 
 ```bash
-source .venv/bin/activate
-pytest
+uv run pytest
 cd frontend
 npm run build
 ```
