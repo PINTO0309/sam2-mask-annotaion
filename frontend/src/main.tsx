@@ -90,6 +90,7 @@ function App() {
   const [images, setImages] = useState<ImageSummary[]>([]);
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [hoveredInstanceId, setHoveredInstanceId] = useState<number | null>(null);
   const [sam2Support, setSam2Support] = useState(false);
   const [brushSize, setBrushSize] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -192,6 +193,7 @@ function App() {
       const maskCanvas = maskCanvases.current.get(annotation.id);
       if (!maskCanvas) return;
       const color = colorPalette[idx % colorPalette.length];
+      const isHovered = annotation.id === hoveredInstanceId;
       const maskCtx = maskCanvas.getContext("2d");
       if (!maskCtx) return;
       const source = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
@@ -201,13 +203,20 @@ function App() {
           overlay.data[i] = color[0];
           overlay.data[i + 1] = color[1];
           overlay.data[i + 2] = color[2];
-          overlay.data[i + 3] = annotation.id === selectedId ? 150 : 95;
+          overlay.data[i + 3] = isHovered ? 210 : annotation.id === selectedId ? 150 : 95;
         }
       }
       const tinted = document.createElement("canvas");
       tinted.width = maskCanvas.width;
       tinted.height = maskCanvas.height;
       tinted.getContext("2d")?.putImageData(overlay, 0, 0);
+      if (isHovered) {
+        ctx.save();
+        ctx.shadowColor = `rgb(${color.join(",")})`;
+        ctx.shadowBlur = Math.max(8, 8 * zoom);
+        ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      }
       ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
     });
 
@@ -237,7 +246,7 @@ function App() {
 
       ctx.restore();
     }
-  }, [brushSize, cursorPoint, detail, sam2Support, selectedId, zoom]);
+  }, [brushSize, cursorPoint, detail, hoveredInstanceId, sam2Support, selectedId, zoom]);
 
   const loadDetail = useCallback(
     async (index: number, imageCount = images.length) => {
@@ -273,6 +282,7 @@ function App() {
       maskCanvases.current = nextMasks;
       setDetail(nextDetail);
       setSelectedId(nextDetail.annotations[0]?.id ?? null);
+      setHoveredInstanceId(null);
       setJumpValue(String(nextDetail.index));
       setUndoStacks({});
       dirtyIdsRef.current = new Set();
@@ -628,6 +638,7 @@ function App() {
     dirtyIdsRef.current = new Set();
     setUndoStacks({});
     setDirtyIds(new Set());
+    setHoveredInstanceId(null);
     await loadImages();
     await loadDetail(currentIndex);
     setStatus("Mask edits reset");
@@ -679,6 +690,7 @@ function App() {
       return next;
     });
     setDetail({ ...detail, annotations: nextAnnotations });
+    setHoveredInstanceId(null);
     setSelectedId(nextAnnotations[0]?.id ?? null);
     setStatus(`Instance #${selectedId} deleted`);
   }, [detail, selectedId]);
@@ -765,6 +777,9 @@ function App() {
         <div className="brand">
           <Sparkles size={20} />
           <h1>SAM2 Mask Annotation</h1>
+          <button title="Reset all mask edits" onClick={() => resetAllMaskEdits().catch((error) => setStatus(`Reset error: ${error.message}`))}>
+            <Trash2 size={18} />
+          </button>
         </div>
         <div className="nav-row">
           <button title="-10" onClick={() => moveImage(-10)}><ArrowBigLeft size={18} /></button>
@@ -795,9 +810,6 @@ function App() {
           </button>
           <button title="Undo" onClick={undo} disabled={selectedUndoCount === 0}>
             <RotateCcw size={18} />
-          </button>
-          <button title="Reset all mask edits" onClick={() => resetAllMaskEdits().catch((error) => setStatus(`Reset error: ${error.message}`))}>
-            <Trash2 size={18} />
           </button>
           <button title="Delete selected instance" onClick={() => deleteSelectedInstance().catch((error) => setStatus(`Delete error: ${error.message}`))} disabled={!selectedId}>
             <UserMinus size={18} />
@@ -839,6 +851,10 @@ function App() {
                 key={annotation.id}
                 className={annotation.id === selectedId ? "instance active" : "instance"}
                 onClick={() => setSelectedId(annotation.id)}
+                onFocus={() => setHoveredInstanceId(annotation.id)}
+                onBlur={() => setHoveredInstanceId(null)}
+                onMouseEnter={() => setHoveredInstanceId(annotation.id)}
+                onMouseLeave={() => setHoveredInstanceId(null)}
               >
                 <span className="swatch" style={{ backgroundColor: `rgb(${color.join(",")})` }} />
                 <span>#{annotation.id}</span>

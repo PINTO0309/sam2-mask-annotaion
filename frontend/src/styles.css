@@ -72,10 +72,17 @@ button.active {
 }
 
 .brand h1 {
+  flex: 1;
   font-size: 16px;
   font-weight: 700;
   line-height: 1.2;
   margin: 0;
+  min-width: 0;
+}
+
+.brand button {
+  flex: 0 0 34px;
+  margin-left: auto;
 }
 
 .nav-row,
@@ -91,7 +98,11 @@ button.active {
 }
 
 .tools {
-  grid-template-columns: repeat(5, 34px);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.tools button {
+  width: 100%;
 }
 
 .model-options {
