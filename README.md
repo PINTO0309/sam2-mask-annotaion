@@ -2,6 +2,8 @@
 
 A browser-based COCO instance mask correction tool that uses `datasets/annotations/wholebody48_person_body_coco.json` and the images under `datasets/images/`.
 
+https://github.com/user-attachments/assets/dfc930e8-42eb-41dd-a004-9b37108842a7
+
 ## Features
 
 - FastAPI backend with a React/Vite frontend.
