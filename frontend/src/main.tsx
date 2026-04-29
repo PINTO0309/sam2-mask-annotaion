@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Download,
   FolderOpen,
+  PaintBucket,
   Plus,
   RotateCcw,
   Trash2,
@@ -49,10 +50,16 @@ type ImageDetail = {
 };
 
 type DrawingAction = "paint" | "erase";
-type UndoStacks = Record<number, string[]>;
+type UndoSnapshot = { annotationId: number; maskPng: string };
+type UndoStacks = Record<number, UndoSnapshot[][]>;
 type CanvasPoint = { x: number; y: number };
 type PanOffset = { x: number; y: number };
 type PanState = { pointerId: number; clientX: number; clientY: number; offset: PanOffset };
+type BucketRegion = { width: number; height: number; pixels: Uint32Array; count: number };
+type BucketRegionResult =
+  | { kind: "fill"; region: BucketRegion }
+  | { kind: "selected" }
+  | { kind: "empty" };
 type SAM2Model = {
   id: string;
   label: string;
@@ -105,6 +112,7 @@ function App() {
   const [cursorPoint, setCursorPoint] = useState<CanvasPoint | null>(null);
   const [panOffset, setPanOffset] = useState<PanOffset>({ x: 0, y: 0 });
   const [ctrlPressed, setCtrlPressed] = useState(false);
+  const [holeFillMode, setHoleFillMode] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const workspaceRef = useRef<HTMLElement | null>(null);
@@ -112,6 +120,8 @@ function App() {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const maskCanvases = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const panStateRef = useRef<PanState | null>(null);
+  const bucketPreviewRef = useRef<BucketRegion | null>(null);
+  const bucketPreviewStatusRef = useRef("");
   const dirtyIdsRef = useRef<Set<number>>(new Set());
   const syncDirtyMasksRef = useRef<() => Promise<void>>(async () => {});
 
@@ -220,6 +230,25 @@ function App() {
       ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
     });
 
+    if (bucketPreviewRef.current && selectedId) {
+      const selectedIndex = detail.annotations.findIndex((annotation) => annotation.id === selectedId);
+      const previewColor = selectedIndex >= 0 ? colorPalette[selectedIndex % colorPalette.length] : [255, 220, 74];
+      const preview = bucketPreviewRef.current;
+      const overlay = ctx.createImageData(preview.width, preview.height);
+      for (let i = 0; i < preview.count; i += 1) {
+        const offset = preview.pixels[i] * 4;
+        overlay.data[offset] = previewColor[0];
+        overlay.data[offset + 1] = previewColor[1];
+        overlay.data[offset + 2] = previewColor[2];
+        overlay.data[offset + 3] = 185;
+      }
+      const tinted = document.createElement("canvas");
+      tinted.width = preview.width;
+      tinted.height = preview.height;
+      tinted.getContext("2d")?.putImageData(overlay, 0, 0);
+      ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
+    }
+
     if (cursorPoint) {
       const scaleX = canvas.width / detail.width;
       const scaleY = canvas.height / detail.height;
@@ -280,6 +309,7 @@ function App() {
         })
       );
       maskCanvases.current = nextMasks;
+      bucketPreviewRef.current = null;
       setDetail(nextDetail);
       setSelectedId(nextDetail.annotations[0]?.id ?? null);
       setHoveredInstanceId(null);
@@ -330,11 +360,13 @@ function App() {
   }, []);
 
   const pushUndo = useCallback(
-    (annotationId: number) => {
-      const maskPng = canvasToMaskPng(annotationId);
+    (anchorAnnotationId: number, annotationIds: number[] = [anchorAnnotationId]) => {
+      const snapshots = annotationIds
+        .filter((annotationId, index, ids) => ids.indexOf(annotationId) === index)
+        .map((annotationId) => ({ annotationId, maskPng: canvasToMaskPng(annotationId) }));
       setUndoStacks((prev) => ({
         ...prev,
-        [annotationId]: [...(prev[annotationId] ?? []), maskPng]
+        [anchorAnnotationId]: [...(prev[anchorAnnotationId] ?? []), snapshots]
       }));
     },
     [canvasToMaskPng]
@@ -379,15 +411,235 @@ function App() {
       const canvas = maskCanvases.current.get(selectedId);
       const ctx = canvas?.getContext("2d");
       if (!canvas || !ctx) return;
+      const radius = Math.max(0.5, brushSize / 2);
       ctx.fillStyle = action === "paint" ? "white" : "black";
       ctx.beginPath();
-      ctx.arc(x, y, Math.max(0.5, brushSize / 2), 0, Math.PI * 2);
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.fill();
+      if (action === "paint" && detail) {
+        detail.annotations.forEach((annotation) => {
+          if (annotation.id === selectedId) return;
+          const otherCanvas = maskCanvases.current.get(annotation.id);
+          const otherCtx = otherCanvas?.getContext("2d");
+          if (!otherCanvas || !otherCtx) return;
+          otherCtx.fillStyle = "black";
+          otherCtx.beginPath();
+          otherCtx.arc(x, y, radius, 0, Math.PI * 2);
+          otherCtx.fill();
+          markDirty(annotation.id);
+        });
+      }
       markDirty(selectedId);
       draw();
     },
-    [brushSize, draw, markDirty, selectedId]
+    [brushSize, detail, draw, markDirty, selectedId]
   );
+
+  const collectBucketRegion = useCallback((x: number, y: number): BucketRegionResult => {
+    if (!detail || !selectedId) return { kind: "empty" };
+    const canvas = maskCanvases.current.get(selectedId);
+    if (!canvas) return { kind: "empty" };
+
+    const { width, height } = canvas;
+    if (width <= 0 || height <= 0) return { kind: "empty" };
+
+    const startX = Math.floor(x);
+    const startY = Math.floor(y);
+    if (startX < 0 || startX >= width || startY < 0 || startY >= height) return { kind: "empty" };
+
+    const pixelCount = width * height;
+    const selectedMask = new Uint8Array(pixelCount);
+    const otherMasks: Uint8Array[] = [];
+    const otherMaskUnion = new Uint8Array(pixelCount);
+    const visited = new Uint8Array(pixelCount);
+    const queue = new Uint32Array(pixelCount);
+    let head = 0;
+    let tail = 0;
+
+    for (const annotation of detail.annotations) {
+      const maskCanvas = maskCanvases.current.get(annotation.id);
+      const maskCtx = maskCanvas?.getContext("2d");
+      if (!maskCanvas || !maskCtx || maskCanvas.width !== width || maskCanvas.height !== height) continue;
+      const maskData = maskCtx.getImageData(0, 0, width, height).data;
+      const targetMask = annotation.id === selectedId ? selectedMask : new Uint8Array(pixelCount);
+      for (let index = 0; index < pixelCount; index += 1) {
+        if (maskData[index * 4] > 127) targetMask[index] = 1;
+      }
+      if (annotation.id !== selectedId) {
+        for (let index = 0; index < pixelCount; index += 1) {
+          if (targetMask[index]) otherMaskUnion[index] = 1;
+        }
+        otherMasks.push(targetMask);
+      }
+    }
+
+    const startIndex = startY * width + startX;
+    const sourceMasks = otherMasks.filter((mask) => mask[startIndex]);
+    if (selectedMask[startIndex] && sourceMasks.length === 0) {
+      return { kind: "selected" };
+    }
+    const canFill = sourceMasks.length > 0
+      ? selectedMask[startIndex]
+        ? (index: number) => selectedMask[index] === 1 && sourceMasks.some((mask) => mask[index] === 1)
+        : (index: number) => sourceMasks.some((mask) => mask[index] === 1)
+      : (index: number) => selectedMask[index] === 0 && otherMaskUnion[index] === 0;
+
+    const enqueue = (x: number, y: number) => {
+      const index = y * width + x;
+      if (visited[index] || !canFill(index)) return;
+      visited[index] = 1;
+      queue[tail] = index;
+      tail += 1;
+    };
+
+    enqueue(startX, startY);
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      if (x > 0) enqueue(x - 1, y);
+      if (x + 1 < width) enqueue(x + 1, y);
+      if (y > 0) enqueue(x, y - 1);
+      if (y + 1 < height) enqueue(x, y + 1);
+    }
+
+    return { kind: "fill", region: { width, height, pixels: queue.slice(0, tail), count: tail } };
+  }, [detail, selectedId]);
+
+  const fillSelectedMaskHoleAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+    const canvas = maskCanvases.current.get(selectedId);
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+
+    const result = collectBucketRegion(x, y);
+    if (result.kind === "selected") {
+      setStatus("Clicked point is already in the selected mask");
+      return;
+    }
+    if (result.kind !== "fill") return;
+
+    pushUndo(selectedId, detail.annotations.map((annotation) => annotation.id));
+    const imageData = ctx.getImageData(0, 0, result.region.width, result.region.height);
+    const { data } = imageData;
+    for (let i = 0; i < result.region.count; i += 1) {
+      const offset = result.region.pixels[i] * 4;
+      data[offset] = 255;
+      data[offset + 1] = 255;
+      data[offset + 2] = 255;
+      data[offset + 3] = 255;
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+    detail.annotations.forEach((annotation) => {
+      if (annotation.id === selectedId) return;
+      const otherCanvas = maskCanvases.current.get(annotation.id);
+      const otherCtx = otherCanvas?.getContext("2d");
+      if (!otherCanvas || !otherCtx) return;
+      const otherImageData = otherCtx.getImageData(0, 0, result.region.width, result.region.height);
+      const otherData = otherImageData.data;
+      for (let i = 0; i < result.region.count; i += 1) {
+        const offset = result.region.pixels[i] * 4;
+        otherData[offset] = 0;
+        otherData[offset + 1] = 0;
+        otherData[offset + 2] = 0;
+        otherData[offset + 3] = 255;
+      }
+      otherCtx.putImageData(otherImageData, 0, 0);
+      markDirty(annotation.id);
+    });
+    bucketPreviewRef.current = null;
+    markDirty(selectedId);
+    draw();
+    setStatus(`Filled enclosed unmasked area: ${result.region.count} px`);
+  }, [collectBucketRegion, detail, draw, markDirty, pushUndo, selectedId]);
+
+  const collectMaskedBucketRegion = useCallback((x: number, y: number): BucketRegion | null => {
+    if (!detail || !selectedId) return null;
+    const canvas = maskCanvases.current.get(selectedId);
+    if (!canvas) return null;
+
+    const { width, height } = canvas;
+    if (width <= 0 || height <= 0) return null;
+
+    const startX = Math.floor(x);
+    const startY = Math.floor(y);
+    if (startX < 0 || startX >= width || startY < 0 || startY >= height) return null;
+
+    const pixelCount = width * height;
+    const maskUnion = new Uint8Array(pixelCount);
+    const visited = new Uint8Array(pixelCount);
+    const queue = new Uint32Array(pixelCount);
+    let head = 0;
+    let tail = 0;
+
+    for (const annotation of detail.annotations) {
+      const maskCanvas = maskCanvases.current.get(annotation.id);
+      const maskCtx = maskCanvas?.getContext("2d");
+      if (!maskCanvas || !maskCtx || maskCanvas.width !== width || maskCanvas.height !== height) continue;
+      const maskData = maskCtx.getImageData(0, 0, width, height).data;
+      for (let index = 0; index < pixelCount; index += 1) {
+        if (maskData[index * 4] > 127) maskUnion[index] = 1;
+      }
+    }
+
+    const startIndex = startY * width + startX;
+    if (!maskUnion[startIndex]) return null;
+
+    const enqueue = (x: number, y: number) => {
+      const index = y * width + x;
+      if (visited[index] || !maskUnion[index]) return;
+      visited[index] = 1;
+      queue[tail] = index;
+      tail += 1;
+    };
+
+    enqueue(startX, startY);
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      if (x > 0) enqueue(x - 1, y);
+      if (x + 1 < width) enqueue(x + 1, y);
+      if (y > 0) enqueue(x, y - 1);
+      if (y + 1 < height) enqueue(x, y + 1);
+    }
+
+    return { width, height, pixels: queue.slice(0, tail), count: tail };
+  }, [detail, selectedId]);
+
+  const unmaskBucketRegionAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+    const region = collectMaskedBucketRegion(x, y);
+    if (!region) {
+      setStatus("Bucket unmask: no mask at clicked point");
+      return;
+    }
+
+    pushUndo(selectedId, detail.annotations.map((annotation) => annotation.id));
+    detail.annotations.forEach((annotation) => {
+      const maskCanvas = maskCanvases.current.get(annotation.id);
+      const maskCtx = maskCanvas?.getContext("2d");
+      if (!maskCanvas || !maskCtx) return;
+      const imageData = maskCtx.getImageData(0, 0, region.width, region.height);
+      const { data } = imageData;
+      for (let i = 0; i < region.count; i += 1) {
+        const offset = region.pixels[i] * 4;
+        data[offset] = 0;
+        data[offset + 1] = 0;
+        data[offset + 2] = 0;
+        data[offset + 3] = 255;
+      }
+      maskCtx.putImageData(imageData, 0, 0);
+      markDirty(annotation.id);
+    });
+
+    bucketPreviewRef.current = null;
+    draw();
+    setStatus(`Unmasked bucket region: ${region.count} px`);
+  }, [collectMaskedBucketRegion, detail, draw, markDirty, pushUndo, selectedId]);
 
   const runSam2 = useCallback(
     async (x: number, y: number) => {
@@ -485,6 +737,7 @@ function App() {
       offset: panOffset
     };
     setCursorPoint(null);
+    bucketPreviewRef.current = null;
     setDrawingAction(null);
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -556,6 +809,10 @@ function App() {
       event.preventDefault();
       const point = canvasPoint(event);
       if (event.button === 2) {
+        if (holeFillMode) {
+          unmaskBucketRegionAt(point.x, point.y);
+          return;
+        }
         pushUndo(selectedId);
         setDrawingAction("erase");
         event.currentTarget.setPointerCapture(event.pointerId);
@@ -563,16 +820,20 @@ function App() {
         return;
       }
       if (event.button !== 0) return;
+      if (holeFillMode) {
+        fillSelectedMaskHoleAt(point.x, point.y);
+        return;
+      }
       if (sam2Support) {
         runSam2(point.x, point.y).catch((error) => setStatus(`SAM2 error: ${error.message}`));
         return;
       }
-      pushUndo(selectedId);
+      pushUndo(selectedId, detail.annotations.map((annotation) => annotation.id));
       setDrawingAction("paint");
       event.currentTarget.setPointerCapture(event.pointerId);
       editMaskAt(point.x, point.y, "paint");
     },
-    [canvasPoint, detail, editMaskAt, pushUndo, runSam2, sam2Support, selectedId, startPan]
+    [canvasPoint, detail, editMaskAt, fillSelectedMaskHoleAt, holeFillMode, pushUndo, runSam2, sam2Support, selectedId, startPan, unmaskBucketRegionAt]
   );
 
   const handlePointerMove = useCallback(
@@ -580,13 +841,31 @@ function App() {
       if (panCanvas(event)) return;
       const point = canvasPoint(event);
       setCursorPoint(point);
+      if (holeFillMode && !drawingAction) {
+        const result = collectBucketRegion(point.x, point.y);
+        bucketPreviewRef.current = result.kind === "fill" ? result.region : null;
+        const nextStatus =
+          result.kind === "fill"
+            ? `Bucket preview: ${result.region.count} px`
+            : result.kind === "selected"
+              ? "Bucket preview: point is already in selected mask"
+              : "Bucket preview: no target";
+        if (bucketPreviewStatusRef.current !== nextStatus) {
+          bucketPreviewStatusRef.current = nextStatus;
+          setStatus(nextStatus);
+        }
+        draw();
+        return;
+      }
+      bucketPreviewRef.current = null;
+      bucketPreviewStatusRef.current = "";
       if (!drawingAction) {
         draw();
         return;
       }
       editMaskAt(point.x, point.y, drawingAction);
     },
-    [canvasPoint, draw, drawingAction, editMaskAt, panCanvas]
+    [canvasPoint, collectBucketRegion, draw, drawingAction, editMaskAt, holeFillMode, panCanvas]
   );
 
   const endDrawing = useCallback(() => {
@@ -618,7 +897,9 @@ function App() {
       ...prev,
       [selectedId]: (prev[selectedId] ?? []).slice(0, -1)
     }));
-    await replaceMask(selectedId, last);
+    for (const snapshot of last) {
+      await replaceMask(snapshot.annotationId, snapshot.maskPng);
+    }
     setStatus("Undo applied");
   }, [replaceMask, selectedId, undoStacks]);
 
@@ -811,6 +1092,22 @@ function App() {
           <button title="Undo" onClick={undo} disabled={selectedUndoCount === 0}>
             <RotateCcw size={18} />
           </button>
+          <button
+            className={holeFillMode ? "active" : ""}
+            title="Fill enclosed unmasked areas"
+            onClick={() => {
+              if (holeFillMode) {
+                bucketPreviewRef.current = null;
+                bucketPreviewStatusRef.current = "";
+                draw();
+              }
+              setHoleFillMode((value) => !value);
+              setStatus(holeFillMode ? "Mask hole fill off" : "Mask hole fill on");
+            }}
+            disabled={!selectedId}
+          >
+            <PaintBucket size={18} />
+          </button>
           <button title="Delete selected instance" onClick={() => deleteSelectedInstance().catch((error) => setStatus(`Delete error: ${error.message}`))} disabled={!selectedId}>
             <UserMinus size={18} />
           </button>
@@ -839,6 +1136,7 @@ function App() {
           <h2>Mouse</h2>
           <div><kbd>Left drag</kbd><span>Paint mask</span></div>
           <div><kbd>Right drag</kbd><span>Erase mask</span></div>
+          <div><kbd>Bucket + right</kbd><span>Unmask region</span></div>
           <div><kbd>Ctrl + drag</kbd><span>Pan image</span></div>
           <div><kbd>Ctrl + wheel</kbd><span>Zoom image</span></div>
           <div><kbd>SAM2 ON + left</kbd><span>SAM2 assist</span></div>
@@ -902,6 +1200,9 @@ function App() {
             onPointerCancel={endDrawing}
             onPointerLeave={() => {
               setCursorPoint(null);
+              bucketPreviewRef.current = null;
+              bucketPreviewStatusRef.current = "";
+              draw();
               if (!panStateRef.current) {
                 endDrawing();
               }
