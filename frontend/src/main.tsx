@@ -59,7 +59,7 @@ type CanvasPoint = { x: number; y: number };
 type PanOffset = { x: number; y: number };
 type PanState = { pointerId: number; clientX: number; clientY: number; offset: PanOffset };
 type BucketRegion = { width: number; height: number; pixels: Uint32Array; count: number };
-type EdgeBarrier = { width: number; height: number; pixels: Uint8Array };
+type EdgeBarrier = { width: number; height: number; pixels: Uint8Array; visiblePixels: Uint8Array };
 type BucketRegionResult =
   | { kind: "fill"; region: BucketRegion }
   | { kind: "selected" }
@@ -140,7 +140,7 @@ function buildEdgeBarrier(data: Uint8ClampedArray, width: number, height: number
     base[index] = data[index * 4] >= 48 ? 1 : 0;
   }
   const closed = erodeBarrier(dilateBarrier(base, width, height), width, height);
-  return { width, height, pixels: dilateBarrier(closed, width, height) };
+  return { width, height, pixels: dilateBarrier(closed, width, height), visiblePixels: closed };
 }
 
 function waitForNextPaint() {
@@ -175,7 +175,7 @@ function App() {
   const [panOffset, setPanOffset] = useState<PanOffset>({ x: 0, y: 0 });
   const [ctrlPressed, setCtrlPressed] = useState(false);
   const [bucketEnabled, setBucketEnabled] = useState(false);
-  const [bucketSource, setBucketSource] = useState<BucketSource>("mask");
+  const [bucketSource, setBucketSource] = useState<BucketSource>("edge");
   const [edgeEnabled, setEdgeEnabled] = useState(false);
   const [edgeLowThreshold, setEdgeLowThreshold] = useState(80);
   const [edgeHighThreshold, setEdgeHighThreshold] = useState(160);
@@ -334,12 +334,9 @@ function App() {
       const x = cursorPoint.x * scaleX;
       const y = cursorPoint.y * scaleY;
       const radius = Math.max(1, (brushSize * scaleX) / 2);
-      const selectedIndex = detail.annotations.findIndex((annotation) => annotation.id === selectedId);
-      const selectedColor = selectedIndex >= 0 ? colorPalette[selectedIndex % colorPalette.length] : [31, 42, 48];
-      const pointerColor = `rgb(${selectedColor.join(",")})`;
 
       ctx.save();
-      ctx.strokeStyle = pointerColor;
+      ctx.strokeStyle = "#000000";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(x - radius - 5, y);
@@ -746,7 +743,35 @@ function App() {
     }
 
     if (tail === 0) return null;
-    return { width, height, pixels: queue.slice(0, tail), count: tail };
+    const regionMask = new Uint8Array(width * height);
+    const pixels = new Uint32Array(width * height);
+    let count = 0;
+    for (let i = 0; i < tail; i += 1) {
+      const index = queue[i];
+      regionMask[index] = 1;
+      pixels[count] = index;
+      count += 1;
+    }
+    for (let i = 0; i < tail; i += 1) {
+      const index = queue[i];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) continue;
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          const neighbor = ny * width + nx;
+          if (!barrier.visiblePixels[neighbor] || regionMask[neighbor]) continue;
+          regionMask[neighbor] = 1;
+          pixels[count] = neighbor;
+          count += 1;
+        }
+      }
+    }
+    return { width, height, pixels: pixels.slice(0, count), count };
   }, [detail, selectedId]);
 
   const paintBucketRegion = useCallback((region: BucketRegion, statusMessage: string) => {
@@ -1082,9 +1107,10 @@ function App() {
       if (startPan(event)) return;
       event.preventDefault();
       const point = canvasPoint(event);
+      const activeBucketSource = edgeEnabled ? bucketSource : "mask";
       if (event.button === 2) {
         if (bucketEnabled) {
-          if (bucketSource === "edge") {
+          if (activeBucketSource === "edge") {
             unmaskEdgeBucketRegionAt(point.x, point.y);
           } else {
             unmaskBucketRegionAt(point.x, point.y);
@@ -1099,7 +1125,7 @@ function App() {
       }
       if (event.button !== 0) return;
       if (bucketEnabled) {
-        if (bucketSource === "edge") {
+        if (activeBucketSource === "edge") {
           fillEdgeBucketRegionAt(point.x, point.y);
         } else {
           fillSelectedMaskHoleAt(point.x, point.y);
@@ -1120,6 +1146,7 @@ function App() {
       bucketSource,
       canvasPoint,
       detail,
+      edgeEnabled,
       editMaskAt,
       fillEdgeBucketRegionAt,
       fillSelectedMaskHoleAt,
@@ -1139,8 +1166,9 @@ function App() {
       const point = canvasPoint(event);
       setCursorPoint(point);
       if (bucketEnabled && !drawingAction) {
+        const activeBucketSource = edgeEnabled ? bucketSource : "mask";
         let nextStatus: string;
-        if (bucketSource === "edge") {
+        if (activeBucketSource === "edge") {
           const region = collectEdgeBucketRegion(point.x, point.y);
           bucketPreviewRef.current = region;
           nextStatus = region
@@ -1426,6 +1454,7 @@ function App() {
                 edgeCanvasRef.current = null;
                 edgeBarrierRef.current = null;
                 setEdgePng(null);
+                setBucketSource("mask");
                 setStatus("Edge overlay off");
               }
             }}
@@ -1442,7 +1471,14 @@ function App() {
                 draw();
               }
               setBucketEnabled((value) => !value);
-              setStatus(bucketEnabled ? "Bucket off" : `${bucketSource === "edge" ? "Edge regions" : "Mask holes"} bucket on`);
+              if (!bucketEnabled && !edgeEnabled && bucketSource === "edge") {
+                setBucketSource("mask");
+              }
+              setStatus(
+                bucketEnabled
+                  ? "Bucket off"
+                  : `${edgeEnabled && bucketSource === "edge" ? "Edge regions" : "Mask holes"} bucket on`
+              );
             }}
             disabled={!selectedId}
           >
@@ -1473,6 +1509,38 @@ function App() {
           ))}
         </section>
         <h2 className="control-heading">Edge Detection Method</h2>
+        <section className="bucket-options" aria-label="bucket source">
+          <button
+            className={bucketSource === "edge" ? "active" : ""}
+            title="Fill regions enclosed by the current edge overlay"
+            onClick={() => {
+              setBucketSource("edge");
+              setBucketEnabled(true);
+              setStatus("Edge regions bucket on");
+              bucketPreviewRef.current = null;
+              bucketPreviewStatusRef.current = "";
+              draw();
+            }}
+            disabled={!edgeEnabled || !selectedId}
+          >
+            Edge
+          </button>
+          <button
+            className={bucketSource === "mask" ? "active" : ""}
+            title="Fill mask-enclosed holes"
+            onClick={() => {
+              setBucketSource("mask");
+              setBucketEnabled(true);
+              bucketPreviewRef.current = null;
+              bucketPreviewStatusRef.current = "";
+              draw();
+              setStatus("Mask holes bucket on");
+            }}
+            disabled={!edgeEnabled || !selectedId}
+          >
+            Mask
+          </button>
+        </section>
         <section className="edge-options" aria-label="edge method">
           <button
             className={edgeMethod === "canny" ? "active" : ""}
@@ -1489,38 +1557,6 @@ function App() {
             disabled={!edgeEnabled}
           >
             DDN
-          </button>
-        </section>
-        <section className="bucket-options" aria-label="bucket source">
-          <button
-            className={bucketSource === "mask" ? "active" : ""}
-            title="Fill mask-enclosed holes"
-            onClick={() => {
-              setBucketSource("mask");
-              setBucketEnabled(true);
-              bucketPreviewRef.current = null;
-              bucketPreviewStatusRef.current = "";
-              draw();
-              setStatus("Mask holes bucket on");
-            }}
-            disabled={!edgeEnabled || !selectedId}
-          >
-            Mask
-          </button>
-          <button
-            className={bucketSource === "edge" ? "active" : ""}
-            title="Fill regions enclosed by the current edge overlay"
-            onClick={() => {
-              setBucketSource("edge");
-              setBucketEnabled(true);
-              setStatus("Edge regions bucket on");
-              bucketPreviewRef.current = null;
-              bucketPreviewStatusRef.current = "";
-              draw();
-            }}
-            disabled={!edgeEnabled || !selectedId}
-          >
-            Edge
           </button>
         </section>
         <label className="slider">
