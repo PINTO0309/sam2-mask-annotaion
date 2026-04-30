@@ -4,6 +4,8 @@ A browser-based COCO instance mask correction tool that uses `datasets/annotatio
 
 https://github.com/user-attachments/assets/dfc930e8-42eb-41dd-a004-9b37108842a7
 
+https://github.com/user-attachments/assets/05f2e08d-2c17-4e38-a795-3d379de6d0ae
+
 ## Features
 
 - FastAPI backend with a React/Vite frontend.
