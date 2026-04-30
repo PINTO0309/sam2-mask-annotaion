@@ -11,6 +11,7 @@ import {
   PaintBucket,
   Plus,
   RotateCcw,
+  ScanLine,
   Trash2,
   UserMinus,
   Save,
@@ -50,12 +51,15 @@ type ImageDetail = {
 };
 
 type DrawingAction = "paint" | "erase";
+type EdgeMethod = "canny" | "ddn";
+type BucketSource = "mask" | "edge";
 type UndoSnapshot = { annotationId: number; maskPng: string };
 type UndoStacks = Record<number, UndoSnapshot[][]>;
 type CanvasPoint = { x: number; y: number };
 type PanOffset = { x: number; y: number };
 type PanState = { pointerId: number; clientX: number; clientY: number; offset: PanOffset };
 type BucketRegion = { width: number; height: number; pixels: Uint32Array; count: number };
+type EdgeBarrier = { width: number; height: number; pixels: Uint8Array };
 type BucketRegionResult =
   | { kind: "fill"; region: BucketRegion }
   | { kind: "selected" }
@@ -80,6 +84,64 @@ const colorPalette = [
   [100, 117, 220],
   [112, 162, 64]
 ];
+
+function dilateBarrier(source: Uint8Array, width: number, height: number) {
+  const result = new Uint8Array(source.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      let value = 0;
+      for (let dy = -1; dy <= 1 && !value; dy += 1) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) continue;
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          if (source[ny * width + nx]) {
+            value = 1;
+            break;
+          }
+        }
+      }
+      result[index] = value;
+    }
+  }
+  return result;
+}
+
+function erodeBarrier(source: Uint8Array, width: number, height: number) {
+  const result = new Uint8Array(source.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let value = 1;
+      for (let dy = -1; dy <= 1 && value; dy += 1) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) {
+          value = 0;
+          break;
+        }
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width || !source[ny * width + nx]) {
+            value = 0;
+            break;
+          }
+        }
+      }
+      result[y * width + x] = value;
+    }
+  }
+  return result;
+}
+
+function buildEdgeBarrier(data: Uint8ClampedArray, width: number, height: number): EdgeBarrier {
+  const base = new Uint8Array(width * height);
+  for (let index = 0; index < base.length; index += 1) {
+    base[index] = data[index * 4] >= 48 ? 1 : 0;
+  }
+  const closed = erodeBarrier(dilateBarrier(base, width, height), width, height);
+  return { width, height, pixels: dilateBarrier(closed, width, height) };
+}
 
 function waitForNextPaint() {
   return new Promise<void>((resolve) => {
@@ -112,12 +174,22 @@ function App() {
   const [cursorPoint, setCursorPoint] = useState<CanvasPoint | null>(null);
   const [panOffset, setPanOffset] = useState<PanOffset>({ x: 0, y: 0 });
   const [ctrlPressed, setCtrlPressed] = useState(false);
-  const [holeFillMode, setHoleFillMode] = useState(false);
+  const [bucketEnabled, setBucketEnabled] = useState(false);
+  const [bucketSource, setBucketSource] = useState<BucketSource>("mask");
+  const [edgeEnabled, setEdgeEnabled] = useState(false);
+  const [edgeLowThreshold, setEdgeLowThreshold] = useState(80);
+  const [edgeHighThreshold, setEdgeHighThreshold] = useState(160);
+  const [edgeOpacity, setEdgeOpacity] = useState(0.85);
+  const [edgePng, setEdgePng] = useState<string | null>(null);
+  const [edgeMethod, setEdgeMethod] = useState<EdgeMethod>("canny");
+  const [ddnEdgeThickness, setDdnEdgeThickness] = useState(1);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const annotationFileInputRef = useRef<HTMLInputElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const edgeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const edgeBarrierRef = useRef<EdgeBarrier | null>(null);
   const maskCanvases = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const panStateRef = useRef<PanState | null>(null);
   const bucketPreviewRef = useRef<BucketRegion | null>(null);
@@ -230,6 +302,13 @@ function App() {
       ctx.drawImage(tinted, 0, 0, canvas.width, canvas.height);
     });
 
+    if (edgeEnabled && edgeCanvasRef.current) {
+      ctx.save();
+      ctx.globalAlpha = edgeOpacity;
+      ctx.drawImage(edgeCanvasRef.current, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    }
+
     if (bucketPreviewRef.current && selectedId) {
       const selectedIndex = detail.annotations.findIndex((annotation) => annotation.id === selectedId);
       const previewColor = selectedIndex >= 0 ? colorPalette[selectedIndex % colorPalette.length] : [255, 220, 74];
@@ -275,7 +354,7 @@ function App() {
 
       ctx.restore();
     }
-  }, [brushSize, cursorPoint, detail, hoveredInstanceId, sam2Support, selectedId, zoom]);
+  }, [brushSize, cursorPoint, detail, edgeEnabled, edgeOpacity, hoveredInstanceId, sam2Support, selectedId, zoom]);
 
   const loadDetail = useCallback(
     async (index: number, imageCount = images.length) => {
@@ -309,8 +388,11 @@ function App() {
         })
       );
       maskCanvases.current = nextMasks;
+      edgeCanvasRef.current = null;
+      edgeBarrierRef.current = null;
       bucketPreviewRef.current = null;
       setDetail(nextDetail);
+      setEdgePng(null);
       setSelectedId(nextDetail.annotations[0]?.id ?? null);
       setHoveredInstanceId(null);
       setJumpValue(String(nextDetail.index));
@@ -336,6 +418,124 @@ function App() {
   useEffect(() => {
     draw();
   }, [draw]);
+
+  useEffect(() => {
+    if (!edgePng) {
+      edgeCanvasRef.current = null;
+      edgeBarrierRef.current = null;
+      draw();
+      return;
+    }
+
+    let active = true;
+    const image = new Image();
+    image.src = edgePng;
+    image.decode()
+      .then(() => {
+        if (!active) return;
+        const canvas = document.createElement("canvas");
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(image, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const { data } = imageData;
+        edgeBarrierRef.current = buildEdgeBarrier(data, canvas.width, canvas.height);
+        for (let i = 0; i < data.length; i += 4) {
+          const edge = data[i];
+          data[i] = 92;
+          data[i + 1] = 226;
+          data[i + 2] = 255;
+          data[i + 3] = edge;
+        }
+        ctx.putImageData(imageData, 0, 0);
+        edgeCanvasRef.current = canvas;
+        draw();
+      })
+      .catch((error) => {
+        if (!active) return;
+        edgeCanvasRef.current = null;
+        edgeBarrierRef.current = null;
+        setStatus(`Edge error: ${error instanceof Error ? error.message : String(error)}`);
+        draw();
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [edgePng]);
+
+  useEffect(() => {
+    if (!edgeEnabled || !detail) {
+      setEdgePng(null);
+      edgeCanvasRef.current = null;
+      edgeBarrierRef.current = null;
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(async () => {
+      if (edgeMethod === "canny" && edgeLowThreshold >= edgeHighThreshold) {
+        setEdgePng(null);
+        edgeCanvasRef.current = null;
+        edgeBarrierRef.current = null;
+        setStatus("Edge error: low threshold must be less than high threshold");
+        return;
+      }
+
+      if (edgeMethod === "ddn") {
+        setBlockingMessage("DDN edge detection");
+        await waitForNextPaint();
+      }
+      try {
+        const params = new URLSearchParams({
+          method: edgeMethod,
+          low_threshold: String(edgeLowThreshold),
+          high_threshold: String(edgeHighThreshold),
+          ddn_thickness: String(ddnEdgeThickness),
+          ddn_model: "m36"
+        });
+        const response = await fetch(`${API}/api/images/${detail.index}/edges?${params}`, {
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const data: {
+          edge_png: string;
+          edge_count: number;
+          method: EdgeMethod;
+          requested_method?: EdgeMethod;
+          fallback?: boolean;
+          warning?: string;
+          thickness?: number;
+          model?: string;
+          encoder?: string;
+        } = await response.json();
+        setEdgePng(data.edge_png);
+        if (data.fallback) {
+          setStatus(`DDN fallback to Canny: ${data.warning ?? "DDN unavailable"}`);
+        } else {
+          const thickness = data.method === "ddn" && data.thickness ? `, ${data.thickness}px` : "";
+          const model = data.method === "ddn" && data.model ? ` ${data.model.toUpperCase()}` : "";
+          setStatus(`${data.method.toUpperCase()}${model} edge overlay ready: ${data.edge_count} px${thickness}`);
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setEdgePng(null);
+        edgeCanvasRef.current = null;
+        edgeBarrierRef.current = null;
+        setStatus(`Edge error: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (edgeMethod === "ddn") setBlockingMessage(null);
+      }
+    }, 250);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeoutId);
+      if (edgeMethod === "ddn") setBlockingMessage(null);
+    };
+  }, [ddnEdgeThickness, detail, edgeEnabled, edgeHighThreshold, edgeLowThreshold, edgeMethod]);
 
   const moveImage = useCallback(
     (delta: number) => {
@@ -507,24 +707,59 @@ function App() {
     return { kind: "fill", region: { width, height, pixels: queue.slice(0, tail), count: tail } };
   }, [detail, selectedId]);
 
-  const fillSelectedMaskHoleAt = useCallback((x: number, y: number) => {
+  const collectEdgeBucketRegion = useCallback((x: number, y: number): BucketRegion | null => {
+    if (!detail || !selectedId) return null;
+    const barrier = edgeBarrierRef.current;
+    if (!barrier || barrier.width !== detail.width || barrier.height !== detail.height) return null;
+
+    const { width, height } = barrier;
+    const startX = Math.floor(x);
+    const startY = Math.floor(y);
+    if (startX < 0 || startX >= width || startY < 0 || startY >= height) return null;
+
+    const startIndex = startY * width + startX;
+    if (barrier.pixels[startIndex]) return null;
+
+    const visited = new Uint8Array(width * height);
+    const queue = new Uint32Array(width * height);
+    let head = 0;
+    let tail = 0;
+
+    const enqueue = (x: number, y: number) => {
+      const index = y * width + x;
+      if (visited[index] || barrier.pixels[index]) return;
+      visited[index] = 1;
+      queue[tail] = index;
+      tail += 1;
+    };
+
+    enqueue(startX, startY);
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      if (x > 0) enqueue(x - 1, y);
+      if (x + 1 < width) enqueue(x + 1, y);
+      if (y > 0) enqueue(x, y - 1);
+      if (y + 1 < height) enqueue(x, y + 1);
+    }
+
+    if (tail === 0) return null;
+    return { width, height, pixels: queue.slice(0, tail), count: tail };
+  }, [detail, selectedId]);
+
+  const paintBucketRegion = useCallback((region: BucketRegion, statusMessage: string) => {
     if (!detail || !selectedId) return;
     const canvas = maskCanvases.current.get(selectedId);
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
 
-    const result = collectBucketRegion(x, y);
-    if (result.kind === "selected") {
-      setStatus("Clicked point is already in the selected mask");
-      return;
-    }
-    if (result.kind !== "fill") return;
-
     pushUndo(selectedId, detail.annotations.map((annotation) => annotation.id));
-    const imageData = ctx.getImageData(0, 0, result.region.width, result.region.height);
+    const imageData = ctx.getImageData(0, 0, region.width, region.height);
     const { data } = imageData;
-    for (let i = 0; i < result.region.count; i += 1) {
-      const offset = result.region.pixels[i] * 4;
+    for (let i = 0; i < region.count; i += 1) {
+      const offset = region.pixels[i] * 4;
       data[offset] = 255;
       data[offset + 1] = 255;
       data[offset + 2] = 255;
@@ -537,10 +772,10 @@ function App() {
       const otherCanvas = maskCanvases.current.get(annotation.id);
       const otherCtx = otherCanvas?.getContext("2d");
       if (!otherCanvas || !otherCtx) return;
-      const otherImageData = otherCtx.getImageData(0, 0, result.region.width, result.region.height);
+      const otherImageData = otherCtx.getImageData(0, 0, region.width, region.height);
       const otherData = otherImageData.data;
-      for (let i = 0; i < result.region.count; i += 1) {
-        const offset = result.region.pixels[i] * 4;
+      for (let i = 0; i < region.count; i += 1) {
+        const offset = region.pixels[i] * 4;
         otherData[offset] = 0;
         otherData[offset + 1] = 0;
         otherData[offset + 2] = 0;
@@ -552,8 +787,31 @@ function App() {
     bucketPreviewRef.current = null;
     markDirty(selectedId);
     draw();
-    setStatus(`Filled enclosed unmasked area: ${result.region.count} px`);
-  }, [collectBucketRegion, detail, draw, markDirty, pushUndo, selectedId]);
+    setStatus(statusMessage);
+  }, [detail, draw, markDirty, pushUndo, selectedId]);
+
+  const fillSelectedMaskHoleAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+
+    const result = collectBucketRegion(x, y);
+    if (result.kind === "selected") {
+      setStatus("Clicked point is already in the selected mask");
+      return;
+    }
+    if (result.kind !== "fill") return;
+
+    paintBucketRegion(result.region, `Filled enclosed unmasked area: ${result.region.count} px`);
+  }, [collectBucketRegion, detail, paintBucketRegion, selectedId]);
+
+  const fillEdgeBucketRegionAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+    const region = collectEdgeBucketRegion(x, y);
+    if (!region) {
+      setStatus(edgeBarrierRef.current ? "Edge bucket: no closed edge region" : "Edge bucket: edge overlay is loading");
+      return;
+    }
+    paintBucketRegion(region, `Filled edge region: ${region.count} px`);
+  }, [collectEdgeBucketRegion, detail, edgeEnabled, paintBucketRegion, selectedId]);
 
   const collectMaskedBucketRegion = useCallback((x: number, y: number): BucketRegion | null => {
     if (!detail || !selectedId) return null;
@@ -610,14 +868,8 @@ function App() {
     return { width, height, pixels: queue.slice(0, tail), count: tail };
   }, [detail, selectedId]);
 
-  const unmaskBucketRegionAt = useCallback((x: number, y: number) => {
+  const clearBucketRegion = useCallback((region: BucketRegion, statusMessage: string) => {
     if (!detail || !selectedId) return;
-    const region = collectMaskedBucketRegion(x, y);
-    if (!region) {
-      setStatus("Bucket unmask: no mask at clicked point");
-      return;
-    }
-
     pushUndo(selectedId, detail.annotations.map((annotation) => annotation.id));
     detail.annotations.forEach((annotation) => {
       const maskCanvas = maskCanvases.current.get(annotation.id);
@@ -638,8 +890,30 @@ function App() {
 
     bucketPreviewRef.current = null;
     draw();
-    setStatus(`Unmasked bucket region: ${region.count} px`);
-  }, [collectMaskedBucketRegion, detail, draw, markDirty, pushUndo, selectedId]);
+    setStatus(statusMessage);
+  }, [detail, draw, markDirty, pushUndo, selectedId]);
+
+  const unmaskBucketRegionAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+    const region = collectMaskedBucketRegion(x, y);
+    if (!region) {
+      setStatus("Bucket unmask: no mask at clicked point");
+      return;
+    }
+
+    clearBucketRegion(region, `Unmasked bucket region: ${region.count} px`);
+  }, [clearBucketRegion, collectMaskedBucketRegion, detail, selectedId]);
+
+  const unmaskEdgeBucketRegionAt = useCallback((x: number, y: number) => {
+    if (!detail || !selectedId) return;
+    const region = collectEdgeBucketRegion(x, y);
+    if (!region) {
+      setStatus(edgeBarrierRef.current ? "Edge bucket unmask: no closed edge region" : "Edge bucket: edge overlay is loading");
+      return;
+    }
+
+    clearBucketRegion(region, `Unmasked edge region: ${region.count} px`);
+  }, [clearBucketRegion, collectEdgeBucketRegion, detail, edgeEnabled, selectedId]);
 
   const runSam2 = useCallback(
     async (x: number, y: number) => {
@@ -809,8 +1083,12 @@ function App() {
       event.preventDefault();
       const point = canvasPoint(event);
       if (event.button === 2) {
-        if (holeFillMode) {
-          unmaskBucketRegionAt(point.x, point.y);
+        if (bucketEnabled) {
+          if (bucketSource === "edge") {
+            unmaskEdgeBucketRegionAt(point.x, point.y);
+          } else {
+            unmaskBucketRegionAt(point.x, point.y);
+          }
           return;
         }
         pushUndo(selectedId);
@@ -820,8 +1098,12 @@ function App() {
         return;
       }
       if (event.button !== 0) return;
-      if (holeFillMode) {
-        fillSelectedMaskHoleAt(point.x, point.y);
+      if (bucketEnabled) {
+        if (bucketSource === "edge") {
+          fillEdgeBucketRegionAt(point.x, point.y);
+        } else {
+          fillSelectedMaskHoleAt(point.x, point.y);
+        }
         return;
       }
       if (sam2Support) {
@@ -833,7 +1115,22 @@ function App() {
       event.currentTarget.setPointerCapture(event.pointerId);
       editMaskAt(point.x, point.y, "paint");
     },
-    [canvasPoint, detail, editMaskAt, fillSelectedMaskHoleAt, holeFillMode, pushUndo, runSam2, sam2Support, selectedId, startPan, unmaskBucketRegionAt]
+    [
+      bucketEnabled,
+      bucketSource,
+      canvasPoint,
+      detail,
+      editMaskAt,
+      fillEdgeBucketRegionAt,
+      fillSelectedMaskHoleAt,
+      pushUndo,
+      runSam2,
+      sam2Support,
+      selectedId,
+      startPan,
+      unmaskBucketRegionAt,
+      unmaskEdgeBucketRegionAt
+    ]
   );
 
   const handlePointerMove = useCallback(
@@ -841,15 +1138,26 @@ function App() {
       if (panCanvas(event)) return;
       const point = canvasPoint(event);
       setCursorPoint(point);
-      if (holeFillMode && !drawingAction) {
-        const result = collectBucketRegion(point.x, point.y);
-        bucketPreviewRef.current = result.kind === "fill" ? result.region : null;
-        const nextStatus =
-          result.kind === "fill"
-            ? `Bucket preview: ${result.region.count} px`
-            : result.kind === "selected"
-              ? "Bucket preview: point is already in selected mask"
-              : "Bucket preview: no target";
+      if (bucketEnabled && !drawingAction) {
+        let nextStatus: string;
+        if (bucketSource === "edge") {
+          const region = collectEdgeBucketRegion(point.x, point.y);
+          bucketPreviewRef.current = region;
+          nextStatus = region
+            ? `Edge bucket preview: ${region.count} px`
+            : edgeBarrierRef.current
+              ? "Edge bucket preview: no closed edge region"
+              : "Edge bucket preview: edge loading";
+        } else {
+          const result = collectBucketRegion(point.x, point.y);
+          bucketPreviewRef.current = result.kind === "fill" ? result.region : null;
+          nextStatus =
+            result.kind === "fill"
+              ? `Bucket preview: ${result.region.count} px`
+              : result.kind === "selected"
+                ? "Bucket preview: point is already in selected mask"
+                : "Bucket preview: no target";
+        }
         if (bucketPreviewStatusRef.current !== nextStatus) {
           bucketPreviewStatusRef.current = nextStatus;
           setStatus(nextStatus);
@@ -865,7 +1173,18 @@ function App() {
       }
       editMaskAt(point.x, point.y, drawingAction);
     },
-    [canvasPoint, collectBucketRegion, draw, drawingAction, editMaskAt, holeFillMode, panCanvas]
+    [
+      bucketEnabled,
+      bucketSource,
+      canvasPoint,
+      collectBucketRegion,
+      collectEdgeBucketRegion,
+      draw,
+      drawingAction,
+      edgeEnabled,
+      editMaskAt,
+      panCanvas
+    ]
   );
 
   const endDrawing = useCallback(() => {
@@ -916,9 +1235,12 @@ function App() {
       return;
     }
     maskCanvases.current = new Map();
+    edgeCanvasRef.current = null;
+    edgeBarrierRef.current = null;
     dirtyIdsRef.current = new Set();
     setUndoStacks({});
     setDirtyIds(new Set());
+    setEdgePng(null);
     setHoveredInstanceId(null);
     await loadImages();
     await loadDetail(currentIndex);
@@ -1034,9 +1356,12 @@ function App() {
           throw new Error(message);
         }
         maskCanvases.current = new Map();
+        edgeCanvasRef.current = null;
+        edgeBarrierRef.current = null;
         dirtyIdsRef.current = new Set();
         setUndoStacks({});
         setDirtyIds(new Set());
+        setEdgePng(null);
         setSelectedId(null);
         setCursorPoint(null);
         const nextImages = await loadImages();
@@ -1089,20 +1414,35 @@ function App() {
           >
             <Sparkles size={18} />
           </button>
-          <button title="Undo" onClick={undo} disabled={selectedUndoCount === 0}>
-            <RotateCcw size={18} />
+          <button
+            className={edgeEnabled ? "active" : ""}
+            title="Image edge overlay"
+            onClick={() => {
+              const nextEnabled = !edgeEnabled;
+              setEdgeEnabled(nextEnabled);
+              if (nextEnabled) {
+                setStatus("Edge overlay loading");
+              } else {
+                edgeCanvasRef.current = null;
+                edgeBarrierRef.current = null;
+                setEdgePng(null);
+                setStatus("Edge overlay off");
+              }
+            }}
+          >
+            <ScanLine size={18} />
           </button>
           <button
-            className={holeFillMode ? "active" : ""}
-            title="Fill enclosed unmasked areas"
+            className={bucketEnabled ? "active" : ""}
+            title="Bucket fill regions"
             onClick={() => {
-              if (holeFillMode) {
+              if (bucketEnabled) {
                 bucketPreviewRef.current = null;
                 bucketPreviewStatusRef.current = "";
                 draw();
               }
-              setHoleFillMode((value) => !value);
-              setStatus(holeFillMode ? "Mask hole fill off" : "Mask hole fill on");
+              setBucketEnabled((value) => !value);
+              setStatus(bucketEnabled ? "Bucket off" : `${bucketSource === "edge" ? "Edge regions" : "Mask holes"} bucket on`);
             }}
             disabled={!selectedId}
           >
@@ -1114,7 +1454,11 @@ function App() {
           <button title="Add instance" onClick={addInstance}>
             <Plus size={18} />
           </button>
+          <button title="Undo" onClick={undo} disabled={selectedUndoCount === 0}>
+            <RotateCcw size={18} />
+          </button>
         </section>
+        <h2 className="control-heading">SAM2.1 model</h2>
         <section className="model-options" aria-label="SAM2 model">
           {sam2Models.map((model) => (
             <button
@@ -1122,20 +1466,123 @@ function App() {
               className={model.id === selectedModelId ? "active" : ""}
               title={`${model.label}${model.available ? "" : " (download on first use)"}`}
               onClick={() => selectSam2Model(model.id)}
+              disabled={!sam2Support}
             >
               {model.label}
             </button>
           ))}
+        </section>
+        <h2 className="control-heading">Edge Detection Method</h2>
+        <section className="edge-options" aria-label="edge method">
+          <button
+            className={edgeMethod === "canny" ? "active" : ""}
+            title="Use OpenCV Canny edge detection"
+            onClick={() => setEdgeMethod("canny")}
+            disabled={!edgeEnabled}
+          >
+            Canny
+          </button>
+          <button
+            className={edgeMethod === "ddn" ? "active" : ""}
+            title="Use DDN-M36 AI edge detection"
+            onClick={() => setEdgeMethod("ddn")}
+            disabled={!edgeEnabled}
+          >
+            DDN
+          </button>
+        </section>
+        <section className="bucket-options" aria-label="bucket source">
+          <button
+            className={bucketSource === "mask" ? "active" : ""}
+            title="Fill mask-enclosed holes"
+            onClick={() => {
+              setBucketSource("mask");
+              setBucketEnabled(true);
+              bucketPreviewRef.current = null;
+              bucketPreviewStatusRef.current = "";
+              draw();
+              setStatus("Mask holes bucket on");
+            }}
+            disabled={!edgeEnabled || !selectedId}
+          >
+            Mask
+          </button>
+          <button
+            className={bucketSource === "edge" ? "active" : ""}
+            title="Fill regions enclosed by the current edge overlay"
+            onClick={() => {
+              setBucketSource("edge");
+              setBucketEnabled(true);
+              setStatus("Edge regions bucket on");
+              bucketPreviewRef.current = null;
+              bucketPreviewStatusRef.current = "";
+              draw();
+            }}
+            disabled={!edgeEnabled || !selectedId}
+          >
+            Edge
+          </button>
         </section>
         <label className="slider">
           <span>Brush</span>
           <input min={1} max={80} type="range" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} />
           <strong>{brushSize}px</strong>
         </label>
+        <label className="slider">
+          <span>Edge low</span>
+          <input
+            disabled={!edgeEnabled || edgeMethod === "ddn"}
+            min={0}
+            max={Math.max(0, edgeHighThreshold - 1)}
+            type="range"
+            value={edgeLowThreshold}
+            onChange={(event) => setEdgeLowThreshold(Math.min(Number(event.target.value), edgeHighThreshold - 1))}
+          />
+          <strong>{edgeLowThreshold}</strong>
+        </label>
+        <label className="slider">
+          <span>Edge high</span>
+          <input
+            disabled={!edgeEnabled || edgeMethod === "ddn"}
+            min={Math.min(255, edgeLowThreshold + 1)}
+            max={255}
+            type="range"
+            value={edgeHighThreshold}
+            onChange={(event) => setEdgeHighThreshold(Math.max(Number(event.target.value), edgeLowThreshold + 1))}
+          />
+          <strong>{edgeHighThreshold}</strong>
+        </label>
+        <label className="slider">
+          <span>Edge</span>
+          <input
+            disabled={!edgeEnabled}
+            min={0.1}
+            max={1}
+            step={0.05}
+            type="range"
+            value={edgeOpacity}
+            onChange={(event) => setEdgeOpacity(Number(event.target.value))}
+          />
+          <strong>{Math.round(edgeOpacity * 100)}%</strong>
+        </label>
+        <label className="slider">
+          <span>DDN px</span>
+          <input
+            disabled={!edgeEnabled || edgeMethod !== "ddn"}
+            min={1}
+            max={2}
+            step={1}
+            type="range"
+            value={ddnEdgeThickness}
+            onChange={(event) => setDdnEdgeThickness(Number(event.target.value))}
+          />
+          <strong>{ddnEdgeThickness}px</strong>
+        </label>
         <section className="legend" aria-label="mouse controls">
           <h2>Mouse</h2>
           <div><kbd>Left drag</kbd><span>Paint mask</span></div>
           <div><kbd>Right drag</kbd><span>Erase mask</span></div>
+          <div><kbd>Bucket + left</kbd><span>Fill region</span></div>
           <div><kbd>Bucket + right</kbd><span>Unmask region</span></div>
           <div><kbd>Ctrl + drag</kbd><span>Pan image</span></div>
           <div><kbd>Ctrl + wheel</kbd><span>Zoom image</span></div>

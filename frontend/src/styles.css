@@ -87,6 +87,8 @@ button.active {
 
 .nav-row,
 .tools,
+.bucket-options,
+.edge-options,
 .model-options,
 .actions {
   display: grid;
@@ -98,7 +100,7 @@ button.active {
 }
 
 .tools {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 .tools button {
@@ -109,11 +111,36 @@ button.active {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.edge-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.bucket-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .model-options button {
   font-size: 12px;
   height: 30px;
   min-width: 0;
   padding: 0 6px;
+}
+
+.bucket-options button,
+.edge-options button {
+  font-size: 12px;
+  height: 30px;
+  min-width: 0;
+}
+
+.control-heading {
+  color: #506069;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.2;
+  margin: 2px 0 -6px;
+  text-transform: uppercase;
 }
 
 .actions {
@@ -151,7 +178,7 @@ button.active {
   align-items: center;
   display: grid;
   gap: 8px;
-  grid-template-columns: 44px 1fr 52px;
+  grid-template-columns: 66px 1fr 56px;
   font-size: 13px;
 }
 

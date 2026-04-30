@@ -9,6 +9,7 @@ https://github.com/user-attachments/assets/dfc930e8-42eb-41dd-a004-9b37108842a7
 - FastAPI backend with a React/Vite frontend.
 - Decodes and encodes COCO Compact RLE masks with `pycocotools`.
 - Displays mask overlays with a different color per instance.
+- Displays an edge overlay with adjustable opacity, using either OpenCV Canny or DDN AI edge detection. DDN supports CAFormer S18, M36, and B36 model selection, and DDN edges can be thinned to 1 px or 2 px from the UI.
 - Supports SAM2.1-assisted correction, SAM2 model switching from the UI, 1 px brush editing, undo, Ctrl + wheel zoom, image navigation, and index-based image jumping.
 - In normal mode, left click or drag paints the mask, and right click or drag erases it. When the SAM2 support toggle is on, left click runs SAM2 assistance.
 - Supports deleting the selected instance. A confirmation dialog is shown before deletion.
@@ -25,12 +26,15 @@ uv venv .venv --python 3.10
 source .venv/bin/activate
 uv sync --active --dev --extra sam2
 python scripts/setup_sam2.py
+./scripts/setup_ddn_edges.sh
 
 cd frontend
 pnpm install
 ```
 
 The default model is `sam2.1_hiera_tiny.pt`. The UI can switch between `Tiny`, `Small`, `Base+`, and `Large`. Missing checkpoints are downloaded automatically when the SAM2 support toggle is turned on. If SAM2 support is already on and you switch models, the selected checkpoint is prepared as part of that switch.
+
+The DDN edge detector runs in a separate `.venv-ddn` Python environment to avoid dependency conflicts with the main FastAPI app and SAM2. The default M36 request downloads the DDN checkpoint into `checkpoints/ddn/`. DDN output is post-processed with thinning and can be requested as `ddn_thickness=1` or `ddn_thickness=2`; model selection uses `ddn_model=s18`, `ddn_model=m36`, or `ddn_model=b36`. S18 and B36 require matching trained DDN checkpoints for the full edge detector; set `DDN_EDGE_S18_CHECKPOINT_PATH` / `DDN_EDGE_S18_CHECKPOINT_URL` or `DDN_EDGE_B36_CHECKPOINT_PATH` / `DDN_EDGE_B36_CHECKPOINT_URL` before using them. If DDN is not set up or inference fails, the app falls back to the Canny edge overlay. The vendored DDN model code is under `backend/app/ai_edges/ddn/` and keeps the upstream Apache-2.0 license and README from https://github.com/Li-yachuan/DDN.
 
 To download checkpoints ahead of time, run:
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from .coco_store import COCOStore
 from .config import IMAGES_DIR, OUTPUT_COCO_PATH, SOURCE_COCO_PATH
+from .edge_service import DDN_MODEL_SPECS, EdgeDetectionService
 from .rle import mask_to_png_data_url, png_data_url_to_mask
 from .sam2_service import SAM2Service, SAM2Unavailable
 
@@ -43,7 +44,11 @@ class OpenAnnotationPayload(BaseModel):
     data: dict[str, Any]
 
 
-def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None = None) -> FastAPI:
+def create_app(
+    store: COCOStore | None = None,
+    sam2_service: SAM2Service | None = None,
+    edge_service: EdgeDetectionService | None = None,
+) -> FastAPI:
     app = FastAPI(title="SAM2 COCO Mask Annotation Tool")
     app.add_middleware(
         CORSMiddleware,
@@ -54,6 +59,7 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
 
     app.state.store = store or COCOStore(SOURCE_COCO_PATH, IMAGES_DIR, OUTPUT_COCO_PATH)
     app.state.sam2 = sam2_service or SAM2Service()
+    app.state.edge_service = edge_service or EdgeDetectionService()
 
     @app.get("/api/health")
     def health():
@@ -79,6 +85,33 @@ def create_app(store: COCOStore | None = None, sam2_service: SAM2Service | None 
         except (IndexError, FileNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return FileResponse(path)
+
+    @app.get("/api/images/{index}/edges")
+    def image_edges(
+        index: int,
+        low_threshold: int = 80,
+        high_threshold: int = 160,
+        method: str = "canny",
+        ddn_thickness: int = 1,
+        ddn_model: str = "m36",
+    ):
+        if method not in {"canny", "ddn"}:
+            raise HTTPException(status_code=400, detail="method must be 'canny' or 'ddn'")
+        if ddn_model not in DDN_MODEL_SPECS:
+            raise HTTPException(status_code=400, detail="ddn_model must be 's18', 'm36', or 'b36'")
+        if ddn_thickness not in {1, 2}:
+            raise HTTPException(status_code=400, detail="ddn_thickness must be 1 or 2")
+        if not 0 <= low_threshold <= 255:
+            raise HTTPException(status_code=400, detail="low_threshold must be between 0 and 255")
+        if not 0 <= high_threshold <= 255:
+            raise HTTPException(status_code=400, detail="high_threshold must be between 0 and 255")
+        if low_threshold >= high_threshold:
+            raise HTTPException(status_code=400, detail="low_threshold must be less than high_threshold")
+        try:
+            path = app.state.store.image_path(index)
+            return app.state.edge_service.detect(path, method, low_threshold, high_threshold, ddn_thickness, ddn_model)
+        except (IndexError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/annotations/open")
     def open_annotation_file(payload: OpenAnnotationPayload):

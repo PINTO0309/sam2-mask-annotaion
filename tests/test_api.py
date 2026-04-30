@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import numpy as np
+from PIL import Image, ImageDraw
 from fastapi.testclient import TestClient
 
+from backend.app.ai_edges.ddn.worker import compress_edge_width
+from backend.app.edge_service import EdgeDetectionService
 from backend.app.main import create_app
-from backend.app.rle import mask_to_compact_rle, mask_to_png_data_url
+from backend.app.rle import mask_to_compact_rle, mask_to_png_data_url, png_data_url_to_mask
+
+
+class FakeEdgeService:
+    def detect(self, image_path, method, low_threshold, high_threshold, ddn_thickness=1, ddn_model="m36"):
+        mask = np.zeros((5, 6), dtype=bool)
+        mask[2, 2:5] = True
+        return {
+            "edge_png": mask_to_png_data_url(mask),
+            "edge_count": 3,
+            "method": method,
+            "requested_method": method,
+            "thickness": ddn_thickness,
+            "model": ddn_model,
+        }
 
 
 class FakeSAM2:
@@ -82,6 +99,121 @@ def test_sam2_predict_endpoint_uses_service(sample_store):
     assert response.status_code == 200
     assert response.json()["mask_png"].startswith("data:image/png;base64,")
     assert sam2.last_model_id == "small"
+
+
+def test_image_edges_endpoint_returns_non_empty_edge_png(sample_store):
+    image = Image.new("L", (32, 32), 0)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((8, 8, 23, 23), fill=255)
+    image.save(sample_store.image_path(1))
+
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    response = client.get("/api/images/1/edges", params={"low_threshold": 80, "high_threshold": 160})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["edge_png"].startswith("data:image/png;base64,")
+    assert data["edge_count"] > 0
+    assert data["method"] == "canny"
+    assert np.count_nonzero(png_data_url_to_mask(data["edge_png"])) > 0
+
+
+def test_image_edges_endpoint_uses_requested_ddn_method(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2(), edge_service=FakeEdgeService())
+    client = TestClient(app)
+
+    response = client.get("/api/images/1/edges", params={"method": "ddn"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["method"] == "ddn"
+    assert data["requested_method"] == "ddn"
+    assert data["edge_count"] == 3
+    assert data["thickness"] == 1
+    assert data["model"] == "m36"
+
+
+def test_image_edges_endpoint_accepts_ddn_thickness(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2(), edge_service=FakeEdgeService())
+    client = TestClient(app)
+
+    response = client.get("/api/images/1/edges", params={"method": "ddn", "ddn_thickness": 2})
+
+    assert response.status_code == 200
+    assert response.json()["thickness"] == 2
+
+
+def test_image_edges_endpoint_accepts_ddn_model(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2(), edge_service=FakeEdgeService())
+    client = TestClient(app)
+
+    response = client.get("/api/images/1/edges", params={"method": "ddn", "ddn_model": "b36"})
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "b36"
+
+
+def test_image_edges_endpoint_falls_back_to_canny_when_ddn_unavailable(sample_store, tmp_path):
+    app = create_app(
+        store=sample_store,
+        sam2_service=FakeSAM2(),
+        edge_service=EdgeDetectionService(ddn_python=tmp_path / "missing-python"),
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/images/1/edges", params={"method": "ddn"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["requested_method"] == "ddn"
+    assert data["method"] == "canny"
+    assert data["fallback"] is True
+    assert "DDN Python environment not found" in data["warning"]
+
+
+def test_image_edges_endpoint_rejects_invalid_thresholds(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    assert client.get("/api/images/1/edges", params={"low_threshold": -1, "high_threshold": 160}).status_code == 400
+    assert client.get("/api/images/1/edges", params={"low_threshold": 80, "high_threshold": 300}).status_code == 400
+    response = client.get("/api/images/1/edges", params={"low_threshold": 160, "high_threshold": 80})
+    assert response.status_code == 400
+    assert "less than high_threshold" in response.json()["detail"]
+
+    invalid_method = client.get("/api/images/1/edges", params={"method": "missing"})
+    assert invalid_method.status_code == 400
+    assert "method must be" in invalid_method.json()["detail"]
+
+    invalid_thickness = client.get("/api/images/1/edges", params={"method": "ddn", "ddn_thickness": 3})
+    assert invalid_thickness.status_code == 400
+    assert "ddn_thickness" in invalid_thickness.json()["detail"]
+
+    invalid_ddn_model = client.get("/api/images/1/edges", params={"method": "ddn", "ddn_model": "missing"})
+    assert invalid_ddn_model.status_code == 400
+    assert "ddn_model" in invalid_ddn_model.json()["detail"]
+
+
+def test_image_edges_endpoint_rejects_missing_image(sample_store):
+    app = create_app(store=sample_store, sam2_service=FakeSAM2())
+    client = TestClient(app)
+
+    assert client.get("/api/images/99/edges").status_code == 404
+
+
+def test_ddn_edge_compression_reduces_wide_probability_band():
+    edge = np.zeros((9, 9), dtype=np.float32)
+    edge[2:7, 3:6] = 0.9
+
+    one_px = compress_edge_width(edge, 1)
+    two_px = compress_edge_width(edge, 2)
+
+    assert np.count_nonzero(one_px) < np.count_nonzero(edge > 0.2)
+    assert np.count_nonzero(two_px) >= np.count_nonzero(one_px)
+    assert np.max(one_px) == 1
+    assert np.max(two_px) == 1
 
 
 def test_delete_annotation_endpoint(sample_store):
